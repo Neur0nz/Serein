@@ -388,8 +388,7 @@ impl Icon {
 	}
 }
 
-/// Decoded per upload rather than cached: the texture owns the pixels afterwards, and a
-/// retained copy would keep 1.7 MB alive for the whole session.
+/// The shared source is decoded on the first visible icon and reused for other scales.
 fn decoded() -> egui::ColorImage {
 	let image = image::load_from_memory_with_format(ATLAS, image::ImageFormat::Png)
 		.expect("bundled icon atlas")
@@ -398,28 +397,19 @@ fn decoded() -> egui::ColorImage {
 	egui::ColorImage::from_rgba_unmultiplied(size, &image)
 }
 
-/// Upload the atlas for `ctx` during application creation, outside the render callback.
-pub fn install(ctx: &egui::Context) {
-	let _ = layer(ctx, 64);
-	let _ = layer(ctx, 32);
-}
-
-#[derive(Clone, Default)]
-struct AtlasLayers {
-	cells: Vec<(u32, TextureHandle)>,
-}
-
 fn source_image() -> &'static ColorImage {
 	static SOURCE: OnceLock<ColorImage> = OnceLock::new();
 	SOURCE.get_or_init(decoded)
 }
 
-fn layer(ctx: &egui::Context, cell: u32) -> TextureHandle {
-	let id = egui::Id::unique(TEXTURE_KEY);
-	if let Some(layers) = ctx.data(|data| data.get_temp::<AtlasLayers>(id))
-		&& let Some((_, texture)) = layers.cells.iter().find(|(stored, _)| *stored == cell)
-	{
-		return texture.clone();
+fn layer(painter: &egui::Painter, cell: u32) -> Option<TextureHandle> {
+	let ctx = painter.ctx();
+	let id = egui::Id::unique((TEXTURE_KEY, cell));
+	if let Some(texture) = ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
+		return Some(texture);
+	}
+	if !painter.is_visible() {
+		return None;
 	}
 	let source = source_image();
 	let longest = source.resolution()[0].max(source.resolution()[1]) as u32;
@@ -430,14 +420,7 @@ fn layer(ctx: &egui::Context, cell: u32) -> TextureHandle {
 		image::imageops::FilterType::Triangle,
 	);
 	let texture = ctx.load_texture("Phosphor Icons 2.1.1", image, egui::TextureOptions::LINEAR);
-	ctx.data_mut(|data| {
-		let mut layers = data.get_temp::<AtlasLayers>(id).unwrap_or_default();
-		if !layers.cells.iter().any(|(stored, _)| *stored == cell) {
-			layers.cells.push((cell, texture.clone()));
-		}
-		data.insert_temp(id, layers);
-	});
-	texture
+	Some(ctx.data_mut(|data| data.get_temp_mut_or_insert_with(id, || texture).clone()))
 }
 
 /// Paint `icon` centred in `rect` with `color`.
@@ -446,8 +429,13 @@ pub fn paint(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
 	let ppp = painter.pixels_per_point();
 	let drawn = size * (CELL / GLYPH);
 	let rect = Rect::from_center_size(rect.center(), Vec2::splat(drawn)).round_to_pixels(ppp);
+	if painter.opacity() == 0.0 || !rect.intersect(painter.clip_rect()).is_positive() {
+		return;
+	}
 	let cell = crate::resample::covering_edge(drawn * ppp, &LAYER_CELLS);
-	let texture = layer(painter.ctx(), cell);
+	let Some(texture) = layer(painter, cell) else {
+		return;
+	};
 	let index = icon.cell();
 	let col = (index % COLUMNS) as f32;
 	let row = (index / COLUMNS) as f32;
@@ -581,4 +569,65 @@ pub fn inline(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> Rect 
 	let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
 	paint(ui.painter(), icon, rect, color);
 	rect
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_first_visible_icon_uploads_only_its_layer() {
+		let ctx = egui::Context::default();
+		let viewport = Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(200.0));
+		let input = egui::RawInput {
+			screen_rect: Some(viewport),
+			..Default::default()
+		};
+		let visible = Rect::from_center_size(viewport.center(), Vec2::splat(18.0));
+		let draw = |painter: &egui::Painter, rect| paint(painter, Icon::Gear, rect, Color32::WHITE);
+		let layers = || {
+			ctx.data(|data| {
+				LAYER_CELLS
+					.into_iter()
+					.filter_map(|cell| {
+						data.get_temp::<TextureHandle>(egui::Id::unique((TEXTURE_KEY, cell)))
+					})
+					.map(|texture| texture.id())
+					.collect::<Vec<_>>()
+			})
+		};
+		ctx.run_ui(input.clone(), |ui| {
+			let mut hidden = ui.painter().clone();
+			hidden.set_invisible();
+			draw(&hidden, visible);
+			let mut transparent = ui.painter().clone();
+			transparent.set_opacity(0.0);
+			draw(&transparent, visible);
+			draw(ui.painter(), visible.translate(viewport.size()));
+		})
+		.drop_without_applying_deltas();
+		assert!(layers().is_empty());
+
+		let draw_visible = |input| {
+			let output = ctx.run_ui(input, |ui| draw(ui.painter(), visible));
+			let layers = layers();
+			let uploaded = output
+				.textures_delta
+				.set
+				.iter()
+				.filter(|(id, _)| layers.contains(id))
+				.count();
+			output.drop_without_applying_deltas();
+			(layers.len(), uploaded)
+		};
+		assert_eq!(draw_visible(input.clone()), (1, 1));
+		assert_eq!(draw_visible(input.clone()), (1, 0));
+		let mut scaled = input;
+		scaled
+			.viewports
+			.get_mut(&egui::ViewportId::ROOT)
+			.unwrap()
+			.native_pixels_per_point = Some(2.0);
+		assert_eq!(draw_visible(scaled), (2, 1));
+	}
 }

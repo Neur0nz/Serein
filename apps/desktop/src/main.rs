@@ -1753,7 +1753,6 @@ impl Desktop {
 	) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
 		ui::fonts::install(&cc.egui_ctx);
 		ui::emoji::install(&cc.egui_ctx)?;
-		ui::icons::install(&cc.egui_ctx);
 		#[cfg(feature = "demo")]
 		if demo {
 			// Fixture-only preset preview, e.g. `--demo --demo-theme=onyx --demo-light`.
