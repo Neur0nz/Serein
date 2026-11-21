@@ -227,3 +227,32 @@ and Post controls. Its content scrolls while the footer remains available. Escap
 the close icon and a backdrop click dismiss an idle editor; a pending submission
 keeps it open. Unknown results and expired but unfinalized polls retain explicit
 status text. `--features demo -- --demo --demo-polls` previews the fixture offline.
+
+## Restoring a saved session
+
+Serein shows the workspace layout during credential lookup and while the Gateway connects.
+The server rail, channel list and timeline use static placeholders. The header shows the
+connection state and offers **Use a different account**. An extension with an approved
+`start_screen` keeps its own start screen.
+
+After Gateway `READY` verifies the account, Serein looks up that account’s last conversation.
+If the user has stayed on the default screen and current permissions allow access, Serein
+opens it through the ordinary history path. That path can display eligible cached messages
+while it fetches current history. The synthetic restoring screen is available with
+`--features demo -- --demo --demo-restoring`.
+
+## Optimistic writes
+
+Routine actions such as reactions, edits, mutes and poll votes update their controls immediately.
+Independent writes share a bounded worker pool. Repeated changes to the same control coalesce
+to the latest value. A superseded write can be canceled before dispatch. Read acknowledgments
+retain their order, and preferences that share an account settings version serialize the full
+read-and-write operation. A forward and its optional note use the ordered writer and report
+failures separately.
+
+Successful writes settle silently. A failed write rolls back the pending change and shows a
+localized notice with the affected item when available. Authoritative events remain the source
+of truth for message history, and submitted edit, note, and nickname drafts are recoverable.
+Server and channel deletion use the confirmed administrative flow. Closing the window gives
+routine writes and local storage a short drain window. Work whose outcome is uncertain opens
+the close confirmation.
