@@ -190,7 +190,7 @@ pub struct Setting {
 	pub channel_flags: Vec<(Id, u32)>,
 }
 impl Setting {
-	fn muted(&self) -> Option<bool> {
+	pub(crate) fn muted(&self) -> Option<bool> {
 		if self.muted == Some(true)
 			&& self
 				.mute_until
@@ -285,7 +285,7 @@ impl Preferences {
 	}
 }
 impl State {
-	pub fn server_notification_settings(
+	pub(crate) fn confirmed_server_notification_settings(
 		&self,
 		guild: Id,
 	) -> crate::server_actions::NotificationOptions {
@@ -297,6 +297,17 @@ impl State {
 			muted: setting.muted(),
 			suppress_everyone: setting.suppress_everyone,
 			suppress_roles: setting.suppress_roles,
+		}
+	}
+	pub fn server_notification_settings(
+		&self,
+		guild: Id,
+	) -> crate::server_actions::NotificationOptions {
+		let confirmed = self.confirmed_server_notification_settings(guild);
+		if let Some(overlay) = self.server_actions.optimistic_notifications(guild) {
+			confirmed.merge(overlay)
+		} else {
+			confirmed
 		}
 	}
 	pub(crate) fn confirm_server_notifications(
@@ -383,11 +394,7 @@ impl State {
 		let Some(guild) = channel.guild else {
 			return false;
 		};
-		if self
-			.notification_preferences
-			.setting(Some(guild))
-			.is_some_and(|setting| setting.muted() == Some(true))
-		{
+		if self.server_notification_settings(guild).muted == Some(true) {
 			return true;
 		}
 		let mut current = Some(channel.id);
@@ -404,7 +411,7 @@ impl State {
 		}
 		false
 	}
-	pub fn guild_channel_muted(&self, channel: Id) -> Option<bool> {
+	pub(crate) fn confirmed_guild_channel_muted(&self, channel: Id) -> Option<bool> {
 		let guild = self.channel(channel)?.guild?;
 		let setting = self.notification_preferences.setting(Some(guild));
 		let muted = setting.and_then(|s| {
@@ -418,7 +425,14 @@ impl State {
 		}
 		muted.or_else(|| (self.demo || setting.is_some()).then_some(false))
 	}
-	pub fn channel_notification_level(&self, channel: Id) -> Option<u8> {
+	pub fn guild_channel_muted(&self, channel: Id) -> Option<bool> {
+		let _ = self.channel(channel)?.guild?;
+		if let Some(muted) = self.channel_actions.optimistic_channel_mute(channel) {
+			return Some(muted);
+		}
+		self.confirmed_guild_channel_muted(channel)
+	}
+	pub(crate) fn confirmed_channel_notification_level(&self, channel: Id) -> Option<u8> {
 		let guild = self.channel(channel)?.guild?;
 		let setting = self.notification_preferences.setting(Some(guild))?;
 		setting
@@ -427,6 +441,13 @@ impl State {
 			.find(|(id, ..)| *id == channel)
 			.and_then(|(_, _, level)| *level)
 			.or(Some(3))
+	}
+	pub fn channel_notification_level(&self, channel: Id) -> Option<u8> {
+		let _ = self.channel(channel)?.guild?;
+		if let Some(level) = self.channel_actions.optimistic_channel_level(channel) {
+			return Some(level);
+		}
+		self.confirmed_channel_notification_level(channel)
 	}
 	pub(crate) fn confirm_channel_mute_timer(
 		&mut self,
@@ -557,10 +578,17 @@ impl State {
 		self.check_notification_capacity()
 	}
 
-	pub fn hides_muted_channels(&self, guild: Id) -> Option<bool> {
+	pub(crate) fn confirmed_hides_muted_channels(&self, guild: Id) -> Option<bool> {
 		self.notification_preferences
 			.setting(Some(guild))
 			.and_then(|setting| setting.hide_muted_channels)
+	}
+
+	pub fn hides_muted_channels(&self, guild: Id) -> Option<bool> {
+		if let Some(hide) = self.channel_actions.optimistic_hide_muted(guild) {
+			return Some(hide);
+		}
+		self.confirmed_hides_muted_channels(guild)
 	}
 
 	pub(crate) fn confirm_guild_hides_muted(
@@ -625,7 +653,7 @@ impl State {
 			.unwrap_or_else(|| (self.demo || setting.muted.is_some()).then_some(false))
 	}
 	/// Service mute state without a pending optimistic toggle; missing partial overrides stay unknown.
-	fn confirmed_dm_muted(&self, channel: Id) -> Option<bool> {
+	pub(crate) fn confirmed_dm_muted(&self, channel: Id) -> Option<bool> {
 		let Some(setting) = self.notification_preferences.settings.get(&None) else {
 			return (self.demo || self.notification_preferences.complete).then_some(false);
 		};
@@ -710,13 +738,24 @@ impl State {
 	/// history can undercount; a partial HTTP read can retain a stale service baseline
 	/// until the Gateway count arrives. This is not an exact total unread count.
 	pub fn unread_count(&self, channel: Id) -> u32 {
-		if self.can_view(channel) {
-			self.read_state.activity.count(channel, false)
-		} else {
-			0
+		if !self.can_view(channel) {
+			return 0;
 		}
+		let latest = self.channel(channel).and_then(|c| c.last_message);
+		if let Some(count) = self.read_state.optimistic_count(channel, latest) {
+			return count;
+		}
+		self.read_state.activity.count(channel, false)
 	}
 	pub fn mention_count(&self, channel: Id) -> u32 {
+		let latest = self.channel(channel).and_then(|c| c.last_message);
+		if let Some(count) = self.read_state.optimistic_count(channel, latest) {
+			return if count > 0 && self.can_view(channel) {
+				count
+			} else {
+				0
+			};
+		}
 		// Most channels have no mentions; skip the permission lookup for those.
 		let count = self.read_state.activity.count(channel, true);
 		if count > 0 && self.can_view(channel) {
@@ -1105,7 +1144,8 @@ impl State {
 			return;
 		}
 		if self
-			.read_marker(message.channel)
+			.read_state
+			.row(message.channel)
 			.flatten()
 			.is_some_and(|read| message.id <= read)
 		{

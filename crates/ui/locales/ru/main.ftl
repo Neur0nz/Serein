@@ -4950,3 +4950,15 @@ moderation-confirm-ban = Забанить
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Плагину пока нечего показать.
+
+# Optimistic write feedback
+action-write-failed = Не удалось выполнить действие «{ $action }». { $reason }
+action-write-failed-for = Не удалось выполнить действие «{ $action }» для { $target }. { $reason }
+action-write-forward-note = Отправить примечание к пересылке
+action-write-poll = Опрос
+action-write-forbidden = Недостаточно прав.
+action-write-rate-limited = Подождите немного и повторите попытку.
+action-write-network = Не удалось подключиться.
+action-write-ambiguous = Результат неизвестен. Проверьте Discord перед повторной попыткой.
+action-write-busy = Слишком много изменений ожидают отправки. Повторите попытку чуть позже.
+action-write-rejected = Discord отклонил изменение или вернул неожиданный ответ.

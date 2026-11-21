@@ -1,7 +1,6 @@
 //! Account messaging preferences in the existing settings shell.
 use crate::{MessagingUi, design};
 use client_core::{Command, State};
-use egui::RichText;
 use model::{
 	Id,
 	messaging_permissions::{Change, MAX_GUILDS},
@@ -70,13 +69,6 @@ fn toggle(ui: &mut egui::Ui, label: &str, detail: Option<&str>, mut value: bool)
 	design::switch(ui, label, detail, &mut value)
 		.changed()
 		.then_some(value)
-}
-fn detail(ui: &mut egui::Ui, text: &str) {
-	ui.label(
-		RichText::new(crate::i18n::translate_if_key(text))
-			.size(13.0)
-			.color(design::palette(ui).muted),
-	);
 }
 const SPAM_FILTERS: [(u32, &str, Option<&str>); 3] = [
 	(3, "Filter all spam", None),
@@ -183,16 +175,6 @@ impl MessagingUi {
 			});
 		}
 		let busy = state.messaging_permissions.pending;
-		// Saving keeps its status line; the first load is sketched where the settings go.
-		if busy && state.messaging_permissions.snapshot.is_some() {
-			ui.horizontal(|ui| {
-				ui.add(egui::Spinner::new().size(14.0));
-				detail(
-					ui,
-					"messaging-permissions-messaging-permissions-settings-saving",
-				);
-			});
-		}
 		if let Some(error) = state.messaging_permissions.error {
 			design::notice(ui, design::Level::Error, error.label());
 			if !busy
@@ -214,7 +196,8 @@ impl MessagingUi {
 			return;
 		};
 		let mut change = None;
-		ui.add_enabled_ui(!busy, |ui| {
+		let interactive = state.demo || state.gateway_connected;
+		ui.add_enabled_ui(interactive, |ui| {
 			nav.heading(ui, Tab::Spam);
 			design::card(ui, |ui| {
 				spam_heading(ui);

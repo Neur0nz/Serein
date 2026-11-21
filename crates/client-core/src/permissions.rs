@@ -1020,20 +1020,19 @@ impl State {
 			self.status = "This message cannot be edited with the current access";
 			return None;
 		}
-		let request = self.optimistic_edit(channel, message, &content)?;
-		Some(Command::Edit {
-			request,
-			channel,
-			message,
-			content,
-		})
+		self.optimistic_edit(channel, message, content)
 	}
 	pub fn prepare_delete(&mut self, channel: Id, message: Id) -> Option<Command> {
 		if !self.can_delete(channel, message) {
 			self.status = "This message cannot be deleted with the current access";
 			return None;
 		}
-		Some(Command::Delete { channel, message })
+		let request = self.optimistic_delete(channel, message)?;
+		Some(Command::Delete {
+			channel,
+			message,
+			request,
+		})
 	}
 	pub(crate) fn permission_access(&self) -> Option<(Option<bool>, Option<bool>)> {
 		self.selected.map(|channel| {

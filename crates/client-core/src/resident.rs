@@ -317,6 +317,12 @@ impl State {
 	pub(crate) fn invalidate_resident_event(&mut self, event: &Event) {
 		let deletion = match event {
 			Event::Delete { channel, id } => Some((*channel, std::slice::from_ref(id))),
+			Event::Deleted {
+				channel,
+				message,
+				result: Ok(()),
+				..
+			} => Some((*channel, std::slice::from_ref(message))),
 			Event::DeleteBulk { channel, ids } if ids.len() <= 100 => {
 				Some((*channel, ids.as_slice()))
 			}

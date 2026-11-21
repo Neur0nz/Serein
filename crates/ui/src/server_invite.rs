@@ -180,9 +180,7 @@ impl InviteDialog {
 		let list_height =
 			(ui.ctx().content_rect().height() - (ui.cursor().top() - ui.min_rect().top()) - 380.0)
 				.clamp(40.0, 240.0);
-		let enabled = state.created_invite(guild).is_some()
-			&& !state.server_invite_pending()
-			&& !state.server_action_pending();
+		let enabled = state.created_invite(guild).is_some() && !state.server_action_pending();
 		let mut send = None;
 		let spacing = ui.spacing().item_spacing.y;
 		ui.spacing_mut().item_spacing.y = 0.0;

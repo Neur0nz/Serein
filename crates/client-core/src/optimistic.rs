@@ -36,6 +36,72 @@ pub enum WriteKind {
 	MessagingPermissions,
 }
 
+/// The operation to name in a failed write notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+	AcceptFriendRequest,
+	AcceptMessageRequest,
+	AddFriend,
+	Block,
+	CloseDm,
+	CreateGroup,
+	DeclineFriendRequest,
+	DeleteMessage,
+	DeleteServer,
+	EditMessage,
+	Forward,
+	ForwardNote,
+	Ignore,
+	IgnoreMessageRequest,
+	LeaveGroup,
+	LeaveServer,
+	MarkRead,
+	Mute,
+	OpenDm,
+	PinMessage,
+	Poll,
+	PollVote,
+	PrivacySetting,
+	Reaction,
+	RemoveFriend,
+	RenameGroup,
+	SaveFolders,
+	SaveNickname,
+	SaveNote,
+	SendInvite,
+	UnpinMessage,
+	UpdateChannel,
+	UpdateGroup,
+	UpdateServer,
+	UpdateServerNotifications,
+}
+
+/// Context for a failed write, formatted into the interface language by the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionError {
+	pub action: ActionKind,
+	pub target: String,
+	pub failure: Failure,
+}
+
+impl ActionError {
+	pub(crate) fn write(action: ActionKind, target: impl Into<String>, failure: Failure) -> Self {
+		let mut target = target.into();
+		if target.len() > MAX_ACTION_ERROR_BYTES {
+			let mut end = MAX_ACTION_ERROR_BYTES;
+			while end > 0 && !target.is_char_boundary(end) {
+				end -= 1;
+			}
+			target.truncate(end);
+		}
+		Self {
+			action,
+			target,
+			failure,
+		}
+	}
+}
+
 /// One tracked key inside [`CoalescedSlot`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry<V> {

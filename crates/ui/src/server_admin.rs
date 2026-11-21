@@ -1042,16 +1042,13 @@ impl Admin {
 		{
 			let blocked = state.user_blocked(member.user.id) == Some(true);
 			if ui
-				.add_enabled(
-					!state.user_action_pending(),
-					egui::Button::new(
-						RichText::new(crate::i18n::translate_if_key(if blocked {
-							"server-admin-member-menu-unblock"
-						} else {
-							"server-admin-member-menu-block"
-						}))
-						.color(colors.danger),
-					),
+				.button(
+					RichText::new(crate::i18n::translate_if_key(if blocked {
+						"server-admin-member-menu-unblock"
+					} else {
+						"server-admin-member-menu-block"
+					}))
+					.color(colors.danger),
 				)
 				.clicked()
 			{

@@ -1,6 +1,6 @@
 use crate::{avatars::Avatars, design, dialog, switcher};
 use client_core::{Command, State};
-use model::{Delivery, Id};
+use model::Id;
 
 /// Destinations listed at once, like the official client; searching finds the rest.
 const DESTINATIONS: usize = 16;
@@ -32,8 +32,6 @@ pub(super) struct ForwardDialog {
 	/// Results for `searched`, rebuilt when the query changes and at most once a second otherwise.
 	results: Vec<Id>,
 	searched: Option<(String, f64)>,
-	/// At most ten nonce strings: one forward and optional note per destination.
-	sent: Vec<(Id, String)>,
 	focus: bool,
 	error: Option<&'static str>,
 }
@@ -68,7 +66,6 @@ impl ForwardDialog {
 		}
 		let mut submit = false;
 		let mut close = false;
-		let submitted = !self.sent.is_empty();
 		let response = dialog::Dialog::new(
 			"forward-message",
 			crate::i18n::translate("forwarding-show-forward-to"),
@@ -130,8 +127,7 @@ impl ForwardDialog {
 							);
 							found = true;
 							let selected = self.targets.contains(&target.id);
-							let enabled = !submitted
-								&& (selected || self.targets.len() < 5)
+							let enabled = (selected || self.targets.len() < 5)
 								&& state.can_compose(target.id);
 							let response = ui
 								.push_id(target.id.0, |ui| {
@@ -225,87 +221,42 @@ impl ForwardDialog {
 					));
 				}
 				ui.add_space(8.0);
-				ui.add_enabled_ui(!submitted, |ui| {
-					design::input(
-						ui,
-						egui::TextEdit::singleline(&mut self.note)
-							.align(egui::Align2::LEFT_CENTER)
-							.hint_text(crate::i18n::translate(
-								"forwarding-show-add-an-optional-message",
-							))
-							.char_limit(
-								client_core::MAX_CONTENT + model::message_options::PREFIX_ALLOWANCE,
-							)
-							.desired_width(f32::INFINITY),
-					)
-				});
+				design::input(
+					ui,
+					egui::TextEdit::singleline(&mut self.note)
+						.align(egui::Align2::LEFT_CENTER)
+						.hint_text(crate::i18n::translate(
+							"forwarding-show-add-an-optional-message",
+						))
+						.char_limit(
+							client_core::MAX_CONTENT + model::message_options::PREFIX_ALLOWANCE,
+						)
+						.desired_width(f32::INFINITY),
+				);
 				if let Some(error) = self.error {
 					design::notice(ui, design::Level::Error, error);
 				}
-				if submitted {
-					for target in &self.targets {
-						let pending: Vec<_> = self
-							.sent
-							.iter()
-							.filter(|(id, _)| id == target)
-							.filter_map(|(_, nonce)| {
-								state.pending.iter().find(|p| &p.nonce == nonce)
-							})
-							.collect();
-						let status = crate::i18n::translate_if_key(
-							if pending.iter().any(|p| p.delivery == Delivery::Ambiguous) {
-								"forwarding-show-outcome-unknown-check-the-destination-before-resending"
-							} else if pending.iter().any(|p| p.delivery == Delivery::Rejected) {
-								"forwarding-show-a-message-failed-check-the-destination"
-							} else if pending.is_empty() {
-								"forwarding-show-sent"
-							} else {
-								"forwarding-show-sending"
-							},
-						);
-						let conversation = state.channel(*target).map_or_else(
-							|| crate::i18n::translate("forwarding-show-conversation"),
-							|c| c.name.clone(),
-						);
-						ui.label(format!("{conversation}: {status}"));
-					}
-				}
 			});
 			d.footer(|ui| {
-				if !submitted {
-					submit = ui
-						.add_enabled_ui(
-							!self.targets.is_empty() && state.can_forward(message),
-							|ui| {
-								dialog::action(ui, "forwarding-show-send", dialog::Action::Primary)
-							},
-						)
-						.inner
-						.clicked();
-				}
-				close = dialog::action(
-					ui,
-					if submitted {
-						"forwarding-show-done"
-					} else {
-						"forwarding-show-cancel"
-					},
-					dialog::Action::Neutral,
-				)
-				.clicked();
+				submit = ui
+					.add_enabled_ui(
+						!self.targets.is_empty() && state.can_forward(message),
+						|ui| dialog::action(ui, "forwarding-show-send", dialog::Action::Primary),
+					)
+					.inner
+					.clicked();
+				close =
+					dialog::action(ui, "forwarding-show-cancel", dialog::Action::Neutral).clicked();
 			});
 		});
 		if submit {
 			let outgoing = state.prepare_forward(message, &self.targets, &self.note);
-			self.error = outgoing.is_empty().then_some(state.status);
-			for command in &outgoing {
-				if let Command::Forward { channel, nonce, .. }
-				| Command::Send { channel, nonce, .. } = command
-				{
-					self.sent.push((*channel, nonce.clone()));
-				}
+			if outgoing.is_empty() {
+				self.error = Some(state.status);
+			} else {
+				commands.extend(outgoing);
+				close = true;
 			}
-			commands.extend(outgoing);
 		}
 		if close || response.close {
 			*self = Self::default();

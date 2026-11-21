@@ -359,7 +359,7 @@ impl State {
 		if boundary.flatten().is_some_and(|read| read >= latest) {
 			return None;
 		}
-		Some(self.mark_read_command(forum, latest, false, None))
+		self.mark_read_command(forum, latest, false, None)
 	}
 
 	pub fn can_load_posts(&self, parent: Id) -> bool {

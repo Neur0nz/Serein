@@ -79,7 +79,13 @@ impl Changes {
 			Event::History {
 				channel, request, ..
 			} if readable(*channel) && *request == state.request => changes.0[1] = true,
-			Event::Delete { channel, .. } | Event::DeleteBulk { channel, .. }
+			Event::Delete { channel, .. }
+			| Event::Deleted {
+				channel,
+				result: Ok(()),
+				..
+			}
+			| Event::DeleteBulk { channel, .. }
 				if readable(*channel) =>
 			{
 				changes.0[1] = true
@@ -349,7 +355,7 @@ fn message_details_changed(state: &State, event: &Event) -> bool {
 			request,
 			result: Ok(m),
 		}) => {
-			state.polls.pending == Some((*channel, *message, *request))
+			state.polls.matches_request(*channel, *message, *request)
 				&& readable(*channel)
 				&& ordinary(m)
 		}

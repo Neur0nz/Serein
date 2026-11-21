@@ -270,8 +270,6 @@ fn thread_member_rows<'a>(
 }
 
 struct SubmittedEdit {
-	channel: Id,
-	message: Id,
 	draft: String,
 	content: String,
 }
@@ -635,7 +633,8 @@ pub struct MessagingUi {
 	pins_anchor: Option<egui::Rect>,
 	editing: Option<(Id, Id, String)>,
 	composer_edit: Option<(Id, Id)>,
-	edit_sent: Option<SubmittedEdit>,
+	/// One raw draft per pending or failed edit in the bounded reducer.
+	submitted_edits: std::collections::BTreeMap<(Id, Id), SubmittedEdit>,
 	deleting: Option<(Id, Id)>,
 	ime_active: bool,
 	/// A composer picker pick returns focus to the draft next frame, once its click is over.
@@ -1550,7 +1549,6 @@ impl MessagingUi {
 				editor.store(ctx, id);
 			}
 		}
-		self.edit_sent = None;
 		self.edit_undo_cleared = true;
 		if untouched {
 			self.editing = None;
@@ -1559,8 +1557,35 @@ impl MessagingUi {
 			self.edit_closed_channel = Some(channel);
 		}
 	}
+	fn restore_failed_edit(&mut self, state: &mut State) {
+		if self.editing.is_none()
+			&& let Some(index) = state
+				.message_actions
+				.failed_edits
+				.iter()
+				.position(|(channel, _, _)| Some(*channel) == state.selected)
+		{
+			let (channel, message, content) = state.message_actions.failed_edits.remove(index);
+			let restored = self
+				.submitted_edits
+				.remove(&(channel, message))
+				.filter(|s| s.content == content)
+				.map_or(content, |s| s.draft);
+			self.editing = Some((channel, message, restored));
+			self.edit_modified = Some((channel, message, true));
+		}
+	}
 	/// Preserves raw active text on failed edits and reconciles unavailable messages.
 	fn reconcile_edit(&mut self, state: &mut State) {
+		self.submitted_edits.retain(|&(channel, message), _| {
+			state.message_actions.edit_pending(channel, message)
+				|| state
+					.message_actions
+					.failed_edits
+					.iter()
+					.any(|(c, m, _)| *c == channel && *m == message)
+		});
+		self.restore_failed_edit(state);
 		let Some((channel, id, content)) = &self.editing else {
 			self.edit_modified = None;
 			self.edit_undo_cleared = false;
@@ -1575,7 +1600,7 @@ impl MessagingUi {
 			.position(|(c, message, _)| c == channel && message == id)
 		{
 			state.message_actions.failed_edits.remove(index);
-			self.edit_sent = None;
+			self.submitted_edits.remove(&(*channel, *id));
 		}
 		if self
 			.edit_modified
@@ -1595,7 +1620,6 @@ impl MessagingUi {
 		{
 			self.editing = None;
 			self.edit_modified = None;
-			self.edit_sent = None;
 		}
 	}
 	/// Window title strip: traffic-light inset, centred context title and session state.
@@ -3442,7 +3466,10 @@ impl MessagingUi {
 	}
 	fn restore_pending(&mut self, state: &mut State, channel: Id, nonce: &str) {
 		if let Some(index) = state.pending.iter().position(|p| {
-			p.nonce == nonce && p.channel == channel && p.delivery != model::Delivery::Sending
+			p.nonce == nonce
+				&& p.channel == channel
+				&& p.delivery != model::Delivery::Sending
+				&& !p.is_forwarded_message()
 		}) {
 			if !state.drafts.contains_key(&channel) && state.drafts.len() >= 64 {
 				state.status =
@@ -3544,7 +3571,7 @@ impl MessagingUi {
 	fn message_request_bar(&mut self, ui: &mut egui::Ui, state: &State, channel: Id) {
 		let colors = design::palette(ui);
 		let language = self.language;
-		let enabled = !state.user_action_pending();
+		let enabled = state.demo || state.gateway_connected;
 		ui.add_space(6.0);
 		egui::Frame::new()
 			.fill(colors.raised)
@@ -3827,7 +3854,7 @@ impl MessagingUi {
 					.size(13.0)
 					.color(colors.muted),
 				);
-				if self.edit_sent.is_some() {
+				if editing_key.is_some_and(|key| self.submitted_edits.contains_key(&key)) {
 					ui.label(
 						RichText::new(crate::i18n::translate(
 							"lib-ime-updates-text-save-requested-check-the-connection-before-retrying",
@@ -4644,11 +4671,10 @@ impl MessagingUi {
                         let edit = output.response;
                         let cleared = draft.is_empty();
                         if edit.changed() || mention_changed {
-                            if editing_here && let Some((_, _, modified)) = &mut self.edit_modified {
-                                *modified = true;
-                            }
                             if editing_here {
-                                self.edit_sent = None;
+                                if let Some((_, _, modified)) = &mut self.edit_modified {
+                                    *modified = true;
+                                }
                             } else if cleared {
                                 self.clear_draft(state, channel);
                             } else {
@@ -4705,19 +4731,33 @@ impl MessagingUi {
                                     })
                                 {
                                     self.deleting = Some((*edit_channel, *message));
-                                } else if state.freshness == Freshness::Fresh
-                                    && let Some(command) = state.prepare_edit(*edit_channel, *message,
-                                        if self.convert_emoticons { emoticons::convert(content) } else { content.clone() })
-                                {
-                                    if let Command::Edit { content: submitted, .. } = &command {
-                                        self.edit_sent = Some(SubmittedEdit {
-                                            channel: *edit_channel,
-                                            message: *message,
-                                            draft: content.clone(),
-                                            content: submitted.clone(),
-                                        });
+                                } else if state.freshness == Freshness::Fresh {
+                                    let submitted_text = if self.convert_emoticons {
+                                        emoticons::convert(content)
+                                    } else {
+                                        content.clone()
+                                    };
+                                    let unchanged = state
+                                        .timeline
+                                        .get(*message)
+                                        .is_some_and(|m| m.channel == *edit_channel && m.content == submitted_text);
+                                    if unchanged && !state.message_actions.edit_pending(*edit_channel, *message) {
+                                        editing = None;
+                                    } else {
+                                        let command = state.prepare_edit(*edit_channel, *message, submitted_text.clone());
+                                        let coalesced = state.message_actions.edit_pending(*edit_channel, *message)
+                                            && state.timeline.get(*message).is_some_and(|m| m.channel == *edit_channel && m.content == submitted_text);
+                                        if command.is_some() || coalesced {
+                                            self.submitted_edits.insert((*edit_channel, *message), SubmittedEdit {
+                                                draft: content.clone(),
+                                                content: submitted_text,
+                                            });
+                                            editing = None;
+                                            commands.extend(command);
+                                        } else {
+                                            state.status = "Edit kept. Wait for your current message and connection, and enter nonempty text.";
+                                        }
                                     }
-                                    commands.push(command);
                                 } else {
                                     state.status = "Edit kept. Wait for your current message and connection, and enter nonempty text.";
                                 }
@@ -4748,29 +4788,6 @@ impl MessagingUi {
             });
 		if editing_here {
 			self.editing = if cancel_edit { None } else { editing };
-			if cancel_edit {
-				self.edit_sent = None;
-			}
-		}
-		if self.edit_sent.as_ref().is_some_and(|submitted| {
-			self.editing
-				.as_ref()
-				.is_some_and(|(channel, message, draft)| {
-					*channel == submitted.channel
-						&& *message == submitted.message
-						&& *draft == submitted.draft
-				}) && !state
-				.message_actions
-				.edit_pending(submitted.channel, submitted.message)
-				&& state
-					.timeline
-					.get(submitted.message)
-					.is_some_and(|message| {
-						message.channel == submitted.channel && message.content == submitted.content
-					})
-		}) {
-			self.editing = None;
-			self.edit_sent = None;
 		}
 	}
 	/// Selected-file cards above the composer input, in the style of Discord's upload tray.
@@ -5293,18 +5310,7 @@ impl MessagingUi {
 			self.pending_mention = None;
 			state.status = "This view has no message box, so the mention was not added.";
 		}
-		if self.editing.is_none()
-			&& let Some(index) = state
-				.message_actions
-				.failed_edits
-				.iter()
-				.position(|(channel, _, _)| Some(*channel) == state.selected)
-		{
-			let (channel, message, content) = state.message_actions.failed_edits.remove(index);
-			self.editing = Some((channel, message, content));
-			self.edit_modified = Some((channel, message, true));
-			self.edit_sent = None;
-		}
+		self.restore_failed_edit(state);
 
 		if self
 			.pending_upload
@@ -6291,7 +6297,6 @@ impl MessagingUi {
 					self.edit_modified = None;
 					self.edit_undo_cleared = false;
 					self.composer_edit = None;
-					self.edit_sent = None;
 				}
 				if std::mem::take(&mut self.timeline.reply_started) {
 					self.focus_switched_composer = true;
@@ -6744,7 +6749,6 @@ impl MessagingUi {
 							*c == channel && *id == message && text.trim().is_empty()
 						}) {
 							self.editing = None;
-							self.edit_sent = None;
 						}
 					}
 					self.deleting = None;
@@ -7494,14 +7498,14 @@ mod composer_tests {
 				panic!("One converted edit")
 			};
 			assert_eq!(content, "Hello 🙂");
-			assert_eq!(view.editing.as_ref().unwrap().2, "Hello :)");
+			assert!(!view.has_edit());
 			assert_eq!(state.timeline.get(Id(20)).unwrap().content, "Hello 🙂");
-			// An optimistic update and an unrelated result must not close the editor.
+			// Unrelated result must not disturb the pending edit.
 			let confirmed = state.timeline.get(Id(20)).unwrap().clone();
 			state.apply_edit_result(Id(10), Id(20), request + 1, Ok(confirmed.clone()));
 			edit_frame(&ctx, &mut view, &mut state, vec![]);
-			assert!(view.has_edit());
-			// Navigation must retain the submitted value and the raw draft.
+			assert!(!view.has_edit());
+			// Navigation retains raw draft for failure recovery until settled.
 			state.selected = Some(Id(11));
 			edit_frame(&ctx, &mut view, &mut state, vec![]);
 			state.selected = Some(Id(10));
@@ -7513,7 +7517,7 @@ mod composer_tests {
 			state.apply_edit_result(Id(10), Id(20), *request, result);
 			edit_frame(&ctx, &mut view, &mut state, vec![]);
 			assert_eq!(state.drafts[&Id(10)], "Unsent draft 👋");
-			assert!(view.edit_sent.is_none());
+			assert!(view.submitted_edits.is_empty());
 			if success {
 				assert!(!view.has_edit());
 			} else {
@@ -7533,18 +7537,19 @@ mod composer_tests {
 	}
 
 	#[test]
-	fn emoticon_conversion_failed_noop_edit_and_success_with_newer_input_stay_open() {
-		for success in [false, true] {
-			let ctx = egui::Context::default();
-			let mut state = edit_state();
-			let mut original = state.timeline.get(Id(20)).unwrap().clone();
-			original.content = "Hello 🙂".into();
-			state.timeline.insert(original, true, false).unwrap();
-			let mut view = MessagingUi {
-				convert_emoticons: true,
-				editing: Some((Id(10), Id(20), "Hello :)".into())),
-				..Default::default()
-			};
+	fn concurrent_failed_edits_keep_each_raw_draft() {
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let mut second = state.timeline.get(Id(20)).unwrap().clone();
+		second.id = Id(21);
+		state.timeline.insert(second, false, false).unwrap();
+		let mut view = MessagingUi {
+			convert_emoticons: true,
+			..Default::default()
+		};
+		let mut requests = Vec::new();
+		for (message, draft) in [(Id(20), "First :)"), (Id(21), "Second :(")] {
+			view.editing = Some((Id(10), message, draft.into()));
 			edit_frame(&ctx, &mut view, &mut state, vec![]);
 			let commands = edit_frame(
 				&ctx,
@@ -7553,27 +7558,44 @@ mod composer_tests {
 				vec![edit_key(egui::Key::Enter)],
 			);
 			let [Command::Edit { request, .. }] = commands.as_slice() else {
-				panic!()
+				panic!("Expected an edit command");
 			};
-			if success {
-				edit_frame(
-					&ctx,
-					&mut view,
-					&mut state,
-					vec![egui::Event::Text(" newer".into())],
-				);
-			}
-			let kept = view.editing.as_ref().unwrap().2.clone();
-			let result = if success {
-				Ok(state.timeline.get(Id(20)).unwrap().clone())
-			} else {
-				Err(client_core::auth::Failure::Network)
-			};
-			state.apply_edit_result(Id(10), Id(20), *request, result);
-			edit_frame(&ctx, &mut view, &mut state, vec![]);
-			assert_eq!(view.editing.as_ref().unwrap().2, kept);
-			assert!(view.edit_sent.is_none());
+			requests.push((message, *request, draft));
 		}
+		for (message, request, draft) in requests {
+			state.apply_edit_result(
+				Id(10),
+				message,
+				request,
+				Err(client_core::auth::Failure::Network),
+			);
+			edit_frame(&ctx, &mut view, &mut state, vec![]);
+			assert_eq!(view.editing.take(), Some((Id(10), message, draft.into())));
+		}
+	}
+
+	#[test]
+	fn emoticon_conversion_noop_edit_closes_immediately_without_network_write() {
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let mut original = state.timeline.get(Id(20)).unwrap().clone();
+		original.content = "Hello 🙂".into();
+		state.timeline.insert(original, true, false).unwrap();
+		let mut view = MessagingUi {
+			convert_emoticons: true,
+			editing: Some((Id(10), Id(20), "Hello :)".into())),
+			..Default::default()
+		};
+		edit_frame(&ctx, &mut view, &mut state, vec![]);
+		let commands = edit_frame(
+			&ctx,
+			&mut view,
+			&mut state,
+			vec![edit_key(egui::Key::Enter)],
+		);
+		assert!(commands.is_empty());
+		assert!(!view.has_edit());
+		assert!(view.submitted_edits.is_empty());
 	}
 
 	fn edit_state() -> State {
@@ -8713,7 +8735,10 @@ mod composer_tests {
 		assert!(
 			matches!(commands.as_slice(), [Command::Edit { channel: Id(10), message: Id(20), content, .. }] if content == "Original <@1> 語")
 		);
-		assert!(view.has_edit(), "optimistic edits await confirmation");
+		assert!(
+			!view.has_edit(),
+			"optimistic edits close inline editor immediately"
+		);
 		assert_eq!(
 			state.timeline.get(Id(20)).unwrap().content,
 			"Original <@1> 語"
@@ -8746,7 +8771,7 @@ mod composer_tests {
 		let [Command::Edit { request, .. }] = commands.as_slice() else {
 			panic!()
 		};
-		assert!(view.has_edit());
+		assert!(!view.has_edit());
 		let confirmed = state.timeline.get(Id(20)).unwrap().clone();
 		view.editing = Some((Id(10), Id(20), "Newer input".into()));
 		state.apply_edit_result(Id(10), Id(20), *request, Ok(confirmed));

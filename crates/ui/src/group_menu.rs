@@ -64,9 +64,7 @@ impl GroupMenu {
 			},
 		);
 		let colors = design::palette(ui);
-		let enabled = (state.demo || state.gateway_connected)
-			&& !state.group_action_pending()
-			&& !state.user_action_pending();
+		let enabled = state.demo || state.gateway_connected;
 		let pinned = view.contains(Shortcut::Pinned, channel.id);
 		if ui
 			.add_enabled_ui(view.available(), |ui| {
@@ -379,6 +377,7 @@ impl GroupMenu {
 				};
 				ui.add_enabled_ui(!busy && !dialog.choosing && valid, |ui| {
 					if crate::dialog::action(ui, label, kind).clicked() {
+						let optimistic_close = !dialog.edit || matches!(dialog.icon, Patch::Absent);
 						let command = if dialog.edit {
 							state.edit_group(
 								dialog.channel,
@@ -389,11 +388,17 @@ impl GroupMenu {
 							state.leave_group(dialog.channel)
 						};
 						if let Some(command) = command {
-							if let Command::GroupAction { request, .. } = &command {
+							if optimistic_close {
+								close = true;
+							} else if let Command::GroupAction { request, .. } = &command {
 								dialog.submitted = Some(*request);
 							}
 							dialog.error = None;
 							commands.push(command);
+						} else if optimistic_close
+							&& state.group_action_status(dialog.channel).is_none()
+						{
+							close = true;
 						} else {
 							dialog.error = state.group_action_status(dialog.channel);
 						}
@@ -718,9 +723,11 @@ mod tests {
 					vec![],
 					&mut commands,
 				);
-				assert!(menu.dialog.as_ref().unwrap().error.is_some());
+				assert!(menu.dialog.is_none());
+				assert!(!state.take_action_errors().is_empty());
+				assert!(state.channel(channel).is_some());
 				if action == "Edit Group" {
-					assert_eq!(menu.dialog.as_ref().unwrap().name, "Renamed group");
+					assert_eq!(state.channel(channel).unwrap().name, "Synthetic group");
 				}
 				let stale = (state.generation, channel, menu.revision);
 				menu.open(&state, state.channel(channel).unwrap(), true);

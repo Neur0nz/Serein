@@ -55,8 +55,86 @@ use wreq::{
 tokio::task_local! {
 	/// Set while a hover preload runs.
 	static SPECULATIVE: ();
+	static BACKGROUND_WRITE: BackgroundWrite;
 }
-/// REST permits a preload must leave free for requests the user is waiting for.
+
+#[derive(Clone)]
+struct BackgroundWrite {
+	cancel: Option<tokio::sync::watch::Receiver<bool>>,
+	deadline: Instant,
+	dispatched: Arc<std::sync::atomic::AtomicBool>,
+	aborted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A background change expired while waiting to be sent.
+pub const WRITE_ADMISSION_EXPIRED: Failure =
+	Failure::ProtocolAt("Timed out before sending the change. Try again.");
+
+impl BackgroundWrite {
+	fn dispatched(&self) -> bool {
+		self.dispatched.load(std::sync::atomic::Ordering::Relaxed)
+	}
+
+	fn cancel(&self) -> Failure {
+		self.aborted
+			.store(true, std::sync::atomic::Ordering::Relaxed);
+		WRITE_ADMISSION_EXPIRED
+	}
+
+	fn timed_out(&self) -> Failure {
+		if self.dispatched() {
+			Failure::Ambiguous
+		} else {
+			WRITE_ADMISSION_EXPIRED
+		}
+	}
+
+	fn begin_request(&self, write: bool) -> Result<(), Failure> {
+		if !self.dispatched() && self.cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
+			return Err(self.cancel());
+		}
+		if Instant::now() >= self.deadline {
+			return Err(self.timed_out());
+		}
+		if write {
+			self.dispatched
+				.store(true, std::sync::atomic::Ordering::Relaxed);
+		}
+		Ok(())
+	}
+
+	async fn cancelled(&self) {
+		if !self.dispatched()
+			&& let Some(mut rx) = self.cancel.clone()
+			&& rx.wait_for(|cancelled| *cancelled).await.is_ok()
+		{
+			return;
+		}
+		std::future::pending::<()>().await;
+	}
+}
+
+/// Waits only before dispatch. In-flight requests keep their transport timeout and rate feedback.
+async fn wait_to_dispatch<T>(future: impl Future<Output = T>) -> Result<T, Failure> {
+	let Ok(write) = BACKGROUND_WRITE.try_with(Clone::clone) else {
+		return Ok(future.await);
+	};
+	tokio::select! {
+		biased;
+		() = write.cancelled() => Err(write.cancel()),
+		() = sleep_until(write.deadline) => Err(write.timed_out()),
+		result = future => Ok(result),
+	}
+}
+
+/// Outcome of executing a pre-wire cancellable write command.
+pub enum WriteOutcome {
+	Event(Box<Event>),
+	/// Cancelled cleanly before the first mutating request was dispatched.
+	Cancelled,
+}
+const REST_PERMITS: usize = 4;
+/// REST permits speculative work and background writes must leave for foreground work.
 const FOREGROUND_PERMITS: usize = 2;
 const READ_RATE_LIMIT_RETRIES: u8 = 2;
 /// Longer JSON limits fail the read at once, so sign-in never stalls silently.
@@ -110,6 +188,7 @@ pub fn api_base() -> &'static str {
 pub struct DiscordApi {
 	interaction_session: std::sync::Mutex<Option<zeroize::Zeroizing<String>>>,
 	ack_token: Mutex<zeroize::Zeroizing<Option<String>>>,
+	account_settings: Mutex<()>,
 	client: Client,
 	proxy: Mutex<ProxyState>,
 	upload_client: tokio::sync::OnceCell<Client>,
@@ -120,6 +199,7 @@ pub struct DiscordApi {
 	admission: admission::Admission,
 	restrictions: std::sync::Mutex<restrictions::Restrictions>,
 	requests: Semaphore,
+	background_requests: Semaphore,
 	terminal: tokio::sync::watch::Sender<Option<Failure>>,
 	expiry: ExpirySlot,
 	catalog: std::sync::Mutex<collectibles::Catalog>,
@@ -505,6 +585,7 @@ impl DiscordApi {
 			upload_client: tokio::sync::OnceCell::new(),
 			upload_verification: std::sync::Mutex::new(None),
 			ack_token: Mutex::new(zeroize::Zeroizing::new(None)),
+			account_settings: Mutex::new(()),
 			client,
 			proxy: Mutex::new(ProxyState {
 				receiver,
@@ -514,7 +595,8 @@ impl DiscordApi {
 			cooldown: Mutex::new(Instant::now()),
 			admission: admission::Admission::default(),
 			restrictions: std::sync::Mutex::default(),
-			requests: Semaphore::new(4),
+			requests: Semaphore::new(REST_PERMITS),
+			background_requests: Semaphore::new(REST_PERMITS - FOREGROUND_PERMITS),
 			terminal: tokio::sync::watch::channel(None).0,
 			expiry: ExpirySlot::default(),
 			catalog: std::sync::Mutex::default(),
@@ -597,6 +679,55 @@ impl DiscordApi {
 			));
 		}
 		Ok(ticket)
+	}
+	/// Keeps each versioned settings read and patch together with respect to this session's writes.
+	async fn account_settings_write(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, Failure> {
+		wait_to_dispatch(self.account_settings.lock()).await
+	}
+	async fn request_permit(
+		&self,
+		speculative: bool,
+	) -> Result<
+		(
+			tokio::sync::SemaphorePermit<'_>,
+			Option<tokio::sync::SemaphorePermit<'_>>,
+		),
+		Failure,
+	> {
+		loop {
+			let background = if speculative {
+				Some(
+					self.background_requests
+						.try_acquire()
+						.map_err(|_| Failure::Capacity)?,
+				)
+			} else if BACKGROUND_WRITE.try_with(|_| ()).is_ok() {
+				Some(
+					self.background_requests
+						.acquire()
+						.await
+						.map_err(|_| Failure::Network)?,
+				)
+			} else {
+				None
+			};
+			let permit = if speculative {
+				if self.requests.available_permits() <= FOREGROUND_PERMITS {
+					return Err(Failure::Capacity);
+				}
+				self.requests.try_acquire().map_err(|_| Failure::Capacity)?
+			} else {
+				self.requests
+					.acquire()
+					.await
+					.map_err(|_| Failure::Network)?
+			};
+			if Instant::now() >= *self.cooldown.lock().await {
+				return Ok((permit, background));
+			}
+			drop((permit, background));
+			self.wait_cooldown(speculative).await?;
+		}
 	}
 	pub fn stop(&self) {
 		self.stop_with(Failure::Expired);
@@ -794,20 +925,6 @@ impl DiscordApi {
 			.map_err(|_| Failure::Protocol)?
 			.check(&method, path, Instant::now())?;
 		let speculative = SPECULATIVE.try_with(|()| ()).is_ok();
-		let _permit = if speculative {
-			// A hover preload takes only spare capacity, so it never delays a click.
-			if self.requests.available_permits() <= FOREGROUND_PERMITS {
-				return Err(Failure::Capacity);
-			}
-			self.requests.try_acquire().map_err(|_| Failure::Capacity)?
-		} else {
-			self.requests
-				.acquire()
-				.await
-				.map_err(|_| Failure::Network)?
-		};
-		// Four permits bound concurrent REST work. A slow profile body must not hold the
-		// cooldown mutex and delay a message write; only service rate admission is shared.
 		let idempotent =
 			method == Method::GET && body.is_none() && prepare.is_none() && !speculative;
 		let mut body = body;
@@ -820,7 +937,7 @@ impl DiscordApi {
 			if let Some(failure) = self.stop_reason() {
 				return Err(failure);
 			}
-			self.wait_cooldown(speculative).await?;
+			wait_to_dispatch(self.wait_cooldown(speculative)).await??;
 			self.restrictions
 				.lock()
 				.map_err(|_| Failure::Protocol)?
@@ -837,9 +954,8 @@ impl DiscordApi {
 			#[cfg(test)]
 			let base = self.base.as_str();
 			let write = method != Method::GET;
-			let mut request = self
-				.rest_client()
-				.await?
+			let mut request = wait_to_dispatch(self.rest_client())
+				.await??
 				.request(method.clone(), format!("{base}{path}"))
 				.header(AUTHORIZATION, authorization);
 			if write {
@@ -889,11 +1005,13 @@ impl DiscordApi {
 				};
 			}
 			// Another response can extend the shared cooldown during route/proxy waits.
-			let mut admission = self
-				.admit_request(&method, path, speculative, || {
+			let mut admission =
+				wait_to_dispatch(self.admit_request(&method, path, speculative, || {
 					retry.is_some_and(|retry| retry.expired())
-				})
-				.await?;
+				}))
+				.await??;
+			// Waiting on a busy or throttled route consumes no shared REST permit.
+			let _permits = wait_to_dispatch(self.request_permit(speculative)).await??;
 			// Proxy configuration and route admission may have awaited. Recheck immediately
 			// before dispatch so a queued request cannot bypass a new security stop.
 			self.restrictions
@@ -903,9 +1021,17 @@ impl DiscordApi {
 			if let Some(failure) = self.stop_reason() {
 				return Err(failure);
 			}
+			if retry.is_some_and(|retry| retry.expired()) {
+				return Err(Failure::ProtocolAt(
+					"Verification expired; start the check again",
+				));
+			}
 			if let Some(prepare) = &mut prepare {
 				request = request.json(&prepare()?);
 			}
+			BACKGROUND_WRITE
+				.try_with(|background| background.begin_request(write))
+				.unwrap_or(Ok(()))?;
 			let response = current_identity(request).send().await.map_err(|_| {
 				if write {
 					Failure::Ambiguous
@@ -1375,6 +1501,27 @@ impl DiscordApi {
 		}
 		event
 	}
+	/// Bounds waits before dispatch without shortening the timeout of a request already on the wire.
+	pub async fn execute_background_write(
+		&self,
+		command: Command,
+		cancel: Option<tokio::sync::watch::Receiver<bool>>,
+		deadline: Instant,
+	) -> WriteOutcome {
+		let signal = BackgroundWrite {
+			cancel,
+			deadline,
+			dispatched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			aborted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		};
+		let aborted = signal.aborted.clone();
+		let event = BACKGROUND_WRITE.scope(signal, self.execute(command)).await;
+		if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+			WriteOutcome::Cancelled
+		} else {
+			WriteOutcome::Event(Box::new(event))
+		}
+	}
 	pub async fn execute(&self, command: Command) -> Event {
 		match command {
 			Command::ApplicationCommands {
@@ -1442,10 +1589,13 @@ impl DiscordApi {
 				sequence,
 				result: self.create_guild(&request).await,
 			},
-			Command::GuildFolders(settings) => Event::GuildFolders(match settings {
-				Some((base, settings)) => self.save_guild_folders(base, settings).await,
-				None => self.guild_folders().await,
-			}),
+			Command::GuildFolders { request, change } => Event::GuildFolders {
+				request,
+				result: match change {
+					Some((base, settings)) => self.save_guild_folders(base, settings).await,
+					None => self.guild_folders().await,
+				},
+			},
 			Command::ChannelAction {
 				guild,
 				channel,
@@ -2170,22 +2320,28 @@ impl DiscordApi {
 					result,
 				}
 			}
-			Command::Delete { channel, message } => {
-				match self
+			Command::Delete {
+				channel,
+				message,
+				request,
+			} => {
+				let result = self
 					.request(
 						Method::DELETE,
 						&format!("/channels/{channel}/messages/{message}"),
 						None,
 					)
 					.await
-				{
-					Ok(_) => Event::Delete {
-						channel,
-						id: message,
-					},
-					Err(Failure::Forbidden) => Event::Unavailable(channel),
-					Err(f) => Event::Failure(f),
+					.map(|_| ());
+				Event::Deleted {
+					channel,
+					message,
+					request,
+					result,
 				}
+			}
+			Command::CancelPendingWrite { kind, request } => {
+				Event::WriteCancelled { kind, request }
 			}
 			Command::Pin {
 				request,
@@ -2228,7 +2384,7 @@ impl DiscordApi {
 		}
 		// Legacy acknowledgement tokens are session-only, redacted by ownership, and never cached.
 		// Manual mark-unread omits the token, matching the unofficial normal-user ack body.
-		let mut token = self.ack_token.lock().await;
+		let mut token = wait_to_dispatch(self.ack_token.lock()).await?;
 		let body = if manual {
 			let mut body = serde_json::json!({"manual": true});
 			if let Some(count) = mention_count {
@@ -3172,21 +3328,34 @@ mod tests {
 				let command = || Command::Delete {
 					channel: Id(20),
 					message: Id(100),
+					request: 1,
 				};
 				assert!(matches!(
 					api.execute(command()).await,
-					Event::Delete {
+					Event::Deleted {
 						channel: Id(20),
-						id: Id(100)
+						message: Id(100),
+						request: 1,
+						result: Ok(())
 					}
 				));
 				assert!(matches!(
 					api.execute(command()).await,
-					Event::Unavailable(Id(20))
+					Event::Deleted {
+						channel: Id(20),
+						message: Id(100),
+						request: 1,
+						result: Err(Failure::Forbidden)
+					}
 				));
 				assert!(matches!(
 					api.execute(command()).await,
-					Event::Failure(Failure::Ambiguous)
+					Event::Deleted {
+						channel: Id(20),
+						message: Id(100),
+						request: 1,
+						result: Err(Failure::Ambiguous)
+					}
 				));
 				server.await.unwrap();
 			})

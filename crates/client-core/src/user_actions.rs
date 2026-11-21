@@ -1,10 +1,11 @@
 //! Explicit account actions; one pending write, never an automatic retry.
+use crate::optimistic::ActionKind;
 use crate::{
 	Command, State,
 	auth::{AuthState, Failure},
 };
 use model::Id;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub const MAX_RELATIONSHIPS: usize = 4000;
 pub const MAX_RELATIONSHIP_BYTES: usize = 128 * 1024;
@@ -12,6 +13,8 @@ pub const MAX_FRIEND_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RESTRICTED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IGNORED_BYTES: usize = 512 * 1024;
 const IGNORED_ENTRY_BYTES: usize = size_of::<(Id, bool)>() + 64;
+/// Session-only personal drafts, each already bounded by `valid_personal_text`.
+const MAX_FAILED_CONTACT_EDITS: usize = 8;
 /// Group DMs hold ten people: the signed-in account and nine others it invites.
 pub const MAX_GROUP_RECIPIENTS: usize = 9;
 
@@ -234,15 +237,161 @@ pub enum Event {
 		challenge: Box<crate::captcha::Challenge>,
 	},
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CoalescedKey {
+	Block(Id),
+	Ignore(Id),
+	Mute(Id),
+	Note(Id),
+	Nickname(Id),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoalescedValue {
+	Bool(bool),
+	Text(String),
+}
+
+impl CoalescedValue {
+	fn as_bool(&self) -> bool {
+		match self {
+			Self::Bool(value) => *value,
+			Self::Text(_) => false,
+		}
+	}
+	fn as_text(&self) -> &str {
+		match self {
+			Self::Text(text) => text.as_str(),
+			Self::Bool(_) => "",
+		}
+	}
+	fn into_text(self) -> String {
+		match self {
+			Self::Text(text) => text,
+			Self::Bool(_) => String::new(),
+		}
+	}
+}
+
+fn coalesced_action(key: CoalescedKey, value: CoalescedValue) -> Action {
+	match key {
+		CoalescedKey::Block(user) => Action::Block {
+			user,
+			blocked: value.as_bool(),
+		},
+		CoalescedKey::Ignore(user) => Action::Ignore {
+			user,
+			ignored: value.as_bool(),
+		},
+		CoalescedKey::Mute(channel) => Action::Mute {
+			channel,
+			muted: value.as_bool(),
+		},
+		CoalescedKey::Note(user) => Action::Note {
+			user,
+			text: value.into_text(),
+		},
+		CoalescedKey::Nickname(user) => Action::Nickname {
+			user,
+			text: value.into_text(),
+		},
+	}
+}
+
+fn action_coalesced_key(action: &Action) -> Option<CoalescedKey> {
+	match action {
+		Action::Block { user, .. } => Some(CoalescedKey::Block(*user)),
+		Action::Ignore { user, .. } => Some(CoalescedKey::Ignore(*user)),
+		Action::Mute { channel, .. } => Some(CoalescedKey::Mute(*channel)),
+		Action::Note { user, .. } => Some(CoalescedKey::Note(*user)),
+		Action::Nickname { user, .. } => Some(CoalescedKey::Nickname(*user)),
+		_ => None,
+	}
+}
+
+fn contact_edit_key(user: Id, nickname: bool) -> CoalescedKey {
+	if nickname {
+		CoalescedKey::Nickname(user)
+	} else {
+		CoalescedKey::Note(user)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OneShotKey {
+	AddFriend(String),
+	ResolveFriend(Id),
+	ProfileFriend(Id),
+	CloseDm(Id),
+	MessageRequest(Id),
+	OpenDm(Id),
+	CreateGroup(Vec<Id>),
+}
+
+fn action_one_shot_key(action: &Action) -> Option<OneShotKey> {
+	match action {
+		Action::AddFriend { username } => Some(OneShotKey::AddFriend(username.clone())),
+		Action::ResolveFriend { user, .. } => Some(OneShotKey::ResolveFriend(*user)),
+		Action::ProfileFriend { user, .. } => Some(OneShotKey::ProfileFriend(*user)),
+		Action::CloseDm(channel) => Some(OneShotKey::CloseDm(*channel)),
+		Action::MessageRequest { channel, .. } => Some(OneShotKey::MessageRequest(*channel)),
+		Action::OpenDm(user) => Some(OneShotKey::OpenDm(*user)),
+		Action::CreateGroup { recipients } => Some(OneShotKey::CreateGroup(recipients.clone())),
+		_ => None,
+	}
+}
+
+struct OneShotEntry {
+	action: Action,
+	label: String,
+	observed: bool,
+	/// Prior membership when the displayed friend map was updated optimistically.
+	pending_friendship: Option<(Id, bool)>,
+	rollback: OneShotRollback,
+}
+
+enum OneShotRollback {
+	AddFriend {
+		username: String,
+	},
+	ResolveFriend {
+		user: Id,
+		entry: (model::User, String, bool),
+		accept: bool,
+	},
+	ProfileFriend {
+		user: Id,
+		friend: bool,
+		inserted_request: bool,
+		removed_friend: Option<(model::User, String, Option<String>, Option<i64>)>,
+	},
+	CloseDm {
+		channel: Option<Box<model::Channel>>,
+	},
+	MessageRequest {
+		channel: Id,
+		accept: bool,
+		removed_channel: Option<Box<model::Channel>>,
+	},
+	OpenDm {
+		origin: (Option<Id>, u64, bool),
+	},
+	CreateGroup {
+		origin: (Option<Id>, u64),
+	},
+}
+
 #[derive(Default)]
 pub struct Actions {
 	note: Option<(Id, String)>,
 	note_request: Option<(Id, u64, bool)>,
+	failed_contact_edits: Vec<(CoalescedKey, Box<str>)>,
 	nicknames: BTreeMap<Id, String>,
 	friends_since: BTreeMap<Id, i64>,
 	requests: BTreeMap<Id, (model::User, String, bool)>,
 	requests_known: bool,
 	last_requested: Option<String>,
+	failed_add_friends: VecDeque<String>,
 	friends: BTreeMap<Id, (model::User, String)>,
 	friends_known: bool,
 	restricted: BTreeMap<Id, (model::User, String, bool)>,
@@ -256,8 +405,20 @@ pub struct Actions {
 	known: bool,
 	view: u64,
 	sequence: u64,
-	pending: Option<(Action, u64, bool)>,
-	challenge: Option<(std::time::Instant, crate::captcha::Challenge)>,
+	/// Bounded latest-wins coalescing for Block, Ignore, DM Mute, Note, and Nickname.
+	coalesced: crate::optimistic::CoalescedSlot<CoalescedKey, CoalescedValue>,
+	coalesced_labels: BTreeMap<CoalescedKey, String>,
+	coalesced_observed: BTreeSet<CoalescedKey>,
+	/// Bounded concurrent one-shot writes (AddFriend, ResolveFriend, ProfileFriend, CloseDm,
+	/// MessageRequest, OpenDm, CreateGroup).
+	one_shots: crate::optimistic::InFlightSet<OneShotKey, OneShotEntry>,
+	challenge: Option<(
+		OneShotKey,
+		Action,
+		u64,
+		std::time::Instant,
+		crate::captcha::Challenge,
+	)>,
 	// Friendship is required only for the existing friend-only navigation callers.
 	dm_origin: Option<(Option<Id>, u64, bool)>,
 	opened_dm: Option<(Id, Id)>,
@@ -268,14 +429,31 @@ pub struct Actions {
 }
 impl Actions {
 	pub(crate) fn reset(&mut self) {
+		let mut coalesced = std::mem::take(&mut self.coalesced);
+		let mut one_shots = std::mem::take(&mut self.one_shots);
+		coalesced.cancel_all();
+		one_shots.cancel_all();
 		*self = Self {
 			sequence: self.sequence,
 			view: self.view.wrapping_add(1),
+			failed_contact_edits: std::mem::take(&mut self.failed_contact_edits),
+			failed_add_friends: std::mem::take(&mut self.failed_add_friends),
+			coalesced,
+			one_shots,
 			..Self::default()
 		};
 	}
 	fn bump_view(&mut self) {
 		self.view = self.view.wrapping_add(1);
+	}
+	fn keep_failed_contact_edit(&mut self, key: CoalescedKey, draft: String) {
+		self.failed_contact_edits
+			.retain(|(target, _)| *target != key);
+		if self.failed_contact_edits.len() >= MAX_FAILED_CONTACT_EDITS {
+			self.failed_contact_edits.remove(0);
+		}
+		self.failed_contact_edits
+			.push((key, draft.into_boxed_str()));
 	}
 }
 impl State {
@@ -284,14 +462,49 @@ impl State {
 		self.user_actions.view
 	}
 	pub fn user_note(&self, user: Id) -> Option<&str> {
+		if let Some(value) = self
+			.user_actions
+			.coalesced
+			.desired(&CoalescedKey::Note(user))
+		{
+			return Some(value.as_text());
+		}
 		self.user_actions
 			.note
 			.as_ref()
 			.filter(|(id, _)| *id == user)
 			.map(|(_, text)| text.as_str())
 	}
+	pub fn user_note_loading(&self, user: Id) -> bool {
+		self.user_actions
+			.note_request
+			.is_some_and(|(id, _, _)| id == user)
+	}
 	pub fn friend_nickname(&self, user: Id) -> Option<&str> {
+		if let Some(value) = self
+			.user_actions
+			.coalesced
+			.desired(&CoalescedKey::Nickname(user))
+		{
+			let text = value.as_text();
+			return (!text.is_empty()).then_some(text);
+		}
 		self.user_actions.nicknames.get(&user).map(String::as_str)
+	}
+	/// Failed personal text can be reopened for retry within this account session.
+	pub fn failed_contact_edit(&self, user: Id, nickname: bool) -> Option<&str> {
+		let key = contact_edit_key(user, nickname);
+		self.user_actions
+			.failed_contact_edits
+			.iter()
+			.find(|(target, _)| *target == key)
+			.map(|(_, text)| text.as_ref())
+	}
+	pub fn discard_failed_contact_edit(&mut self, user: Id, nickname: bool) {
+		let key = contact_edit_key(user, nickname);
+		self.user_actions
+			.failed_contact_edits
+			.retain(|(target, _)| *target != key);
 	}
 	/// When the friendship began, if the service reported it for a current friend.
 	pub fn friend_since(&self, user: Id) -> Option<i64> {
@@ -527,12 +740,39 @@ impl State {
 				.requests
 				.values()
 				.any(|(_, n, _)| n == &username)
+			|| self
+				.user_actions
+				.one_shots
+				.contains(&OneShotKey::AddFriend(username.clone()))
 		{
 			self.user_actions.status =
 				Some("Already friends or a request is pending. Check the Pending tab.");
 			return None;
 		}
 		self.request_user_action(Action::AddFriend { username })
+	}
+	/// In-flight outgoing friend requests not yet confirmed by a Gateway `RELATIONSHIP_ADD`.
+	pub fn optimistic_outgoing_requests(&self) -> Vec<String> {
+		self.user_actions
+			.one_shots
+			.iter()
+			.filter_map(|(key, _)| match key {
+				OneShotKey::AddFriend(username)
+					if !self
+						.user_actions
+						.requests
+						.values()
+						.any(|(_, name, incoming)| !*incoming && name == username) =>
+				{
+					Some(username.clone())
+				}
+				_ => None,
+			})
+			.collect()
+	}
+	/// Consumes a failed `AddFriend` username so the UI can restore an empty input box.
+	pub fn take_failed_add_friend(&mut self) -> Option<String> {
+		self.user_actions.failed_add_friends.pop_front()
 	}
 	pub fn add_profile_friend(&mut self, user: Id) -> Option<Command> {
 		if !self.profile_friend_action_allowed(user)
@@ -546,6 +786,10 @@ impl State {
 	pub fn remove_friend(&mut self, user: Id) -> Option<Command> {
 		if !self.profile_friend_action_allowed(user)
 			|| !self.user_actions.friends.contains_key(&user)
+			|| self
+				.user_actions
+				.one_shots
+				.contains(&OneShotKey::ResolveFriend(user))
 		{
 			return None;
 		}
@@ -564,40 +808,52 @@ impl State {
 	/// Accepts or declines one incoming friend request.
 	pub fn resolve_friend_request(&mut self, user: Id, accept: bool) -> Option<Command> {
 		let (_, _, incoming) = self.user_actions.requests.get(&user)?;
-		if (accept && !incoming) || self.user_blocked(user) != Some(false) {
+		if (accept && !incoming)
+			|| self.user_blocked(user) != Some(false)
+			|| self
+				.user_actions
+				.one_shots
+				.contains(&OneShotKey::ProfileFriend(user))
+		{
 			return None;
 		}
 		self.request_user_action(Action::ResolveFriend { user, accept })
 	}
 	/// The one pending account write that is waiting on a user-solved challenge.
 	pub fn account_challenge(&self) -> Option<(u64, &crate::captcha::Challenge)> {
-		let (action, request, _) = self.user_actions.pending.as_ref()?;
+		let (_, action, request, at, challenge) = self.user_actions.challenge.as_ref()?;
 		if !challengeable(action) {
 			return None;
 		}
-		let (at, challenge) = self.user_actions.challenge.as_ref()?;
 		(at.elapsed() < crate::captcha::LIFETIME).then_some((*request, challenge))
 	}
 	/// The user-visible flow for the pending account challenge.
 	pub(crate) fn account_verification(
 		&self,
 	) -> Option<(crate::captcha::Verification, &crate::captcha::Challenge)> {
-		let (request, challenge) = self.account_challenge()?;
-		let direct = matches!(self.user_actions.pending, Some((Action::OpenDm(_), _, _)));
+		let (_, action, request, at, challenge) = self.user_actions.challenge.as_ref()?;
+		if !challengeable(action) || at.elapsed() >= crate::captcha::LIFETIME {
+			return None;
+		}
+		let direct = matches!(action, Action::OpenDm(_));
 		Some((
 			if direct {
-				crate::captcha::Verification::Direct { request }
+				crate::captcha::Verification::Direct { request: *request }
 			} else {
-				crate::captcha::Verification::Friend { request }
+				crate::captcha::Verification::Friend { request: *request }
 			},
 			challenge,
 		))
 	}
-	/// Releases a challenged write that will not be resumed and reports why.
+	/// Releases a challenged write that will not be resumed, rolling back that target cleanly.
 	fn release_challenge(&mut self, cancelled: bool) {
-		self.user_actions.challenge = None;
-		let direct = matches!(self.user_actions.pending, Some((Action::OpenDm(_), _, _)));
-		self.user_actions.pending = None;
+		let Some((key, action, seq, _, _)) = self.user_actions.challenge.take() else {
+			return;
+		};
+		let direct = matches!(action, Action::OpenDm(_));
+		if let Some(entry) = self.user_actions.one_shots.finish(&key, seq) {
+			self.rollback_one_shot(entry, None);
+		}
 		if direct {
 			self.user_actions.dm_origin = None;
 			self.user_actions.opened_dm = None;
@@ -622,16 +878,13 @@ impl State {
 		if self.account_challenge()?.0 != request {
 			return None;
 		}
-		let action = match self.user_actions.pending.as_ref() {
-			Some((action, _, _)) => action.clone(),
-			_ => return None,
-		};
+		let (key, action, old_seq, at, challenge) = self.user_actions.challenge.take()?;
+		let entry = self.user_actions.one_shots.finish(&key, old_seq)?;
 		let target = challenge_target(&action)?;
-		let (at, challenge) = self.user_actions.challenge.take()?;
 		// The new identity makes a duplicated response to the first attempt stale.
-		self.user_actions.sequence = self.user_actions.sequence.wrapping_add(1);
-		let request = self.user_actions.sequence;
-		self.user_actions.pending = Some((action.clone(), request, false));
+		let Ok(request) = self.user_actions.one_shots.insert(key, entry) else {
+			return None;
+		};
 		Some(Command::UserAction {
 			action,
 			request,
@@ -659,7 +912,7 @@ impl State {
 			.user_actions
 			.challenge
 			.as_ref()
-			.is_some_and(|(at, _)| at.elapsed() >= crate::captcha::LIFETIME)
+			.is_some_and(|(_, _, _, at, _)| at.elapsed() >= crate::captcha::LIFETIME)
 		{
 			self.release_challenge(false);
 		}
@@ -735,62 +988,33 @@ impl State {
 	}
 	/// Committed relationship snapshots only; optimistic toggles cannot prove server eligibility.
 	pub(crate) fn service_author_excluded(&self, user: Id) -> Option<bool> {
-		let blocked = self
-			.user_actions
-			.relationships
-			.get(&user)
-			.copied()
-			.or_else(|| (self.demo || self.user_actions.known).then_some(false));
-		let ignored = self
-			.user_actions
-			.ignored
-			.get(&user)
-			.copied()
-			.or_else(|| self.user_actions.restricted.get(&user).map(|entry| entry.2))
-			.or_else(|| (self.demo || self.user_actions.restricted_known).then_some(false));
+		let blocked = self.confirmed_user_blocked(user);
+		let ignored = self.confirmed_user_ignored(user);
 		match (blocked, ignored) {
 			(Some(true), _) | (_, Some(true)) => Some(true),
 			(Some(false), Some(false)) => {
-				let changing = matches!(&self.user_actions.pending,
-					Some((Action::Block {user: target, ..} | Action::Ignore {user: target, ..}, _, _)) if *target == user);
+				let changing = self
+					.user_actions
+					.coalesced
+					.entry(&CoalescedKey::Block(user))
+					.is_some() || self
+					.user_actions
+					.coalesced
+					.entry(&CoalescedKey::Ignore(user))
+					.is_some();
 				(!changing).then_some(false)
 			}
 			_ => None,
 		}
 	}
-	pub fn user_blocked(&self, user: Id) -> Option<bool> {
-		if let Some((
-			Action::Block {
-				user: target,
-				blocked,
-			},
-			_,
-			false,
-		)) = &self.user_actions.pending
-			&& *target == user
-		{
-			return Some(*blocked);
-		}
+	fn confirmed_user_blocked(&self, user: Id) -> Option<bool> {
 		self.user_actions
 			.relationships
 			.get(&user)
 			.copied()
 			.or_else(|| (self.demo || self.user_actions.known).then_some(false))
 	}
-	/// Whether the user is ignored, including an optimistic pending toggle; `None` while unknown.
-	pub fn user_ignored(&self, user: Id) -> Option<bool> {
-		if let Some((
-			Action::Ignore {
-				user: target,
-				ignored,
-			},
-			_,
-			false,
-		)) = &self.user_actions.pending
-			&& *target == user
-		{
-			return Some(*ignored);
-		}
+	fn confirmed_user_ignored(&self, user: Id) -> Option<bool> {
 		if let Some(ignored) = self.user_actions.ignored.get(&user) {
 			return Some(*ignored);
 		}
@@ -798,6 +1022,27 @@ impl State {
 			return Some(*ignored);
 		}
 		(self.demo || self.user_actions.restricted_known).then_some(false)
+	}
+	pub fn user_blocked(&self, user: Id) -> Option<bool> {
+		if let Some(value) = self
+			.user_actions
+			.coalesced
+			.desired(&CoalescedKey::Block(user))
+		{
+			return Some(value.as_bool());
+		}
+		self.confirmed_user_blocked(user)
+	}
+	/// Whether the user is ignored, including an optimistic pending toggle; `None` while unknown.
+	pub fn user_ignored(&self, user: Id) -> Option<bool> {
+		if let Some(value) = self
+			.user_actions
+			.coalesced
+			.desired(&CoalescedKey::Ignore(user))
+		{
+			return Some(value.as_bool());
+		}
+		self.confirmed_user_ignored(user)
 	}
 	/// Record a committed ignore/unignore without requiring a display profile.
 	fn store_ignored(&mut self, user: Id, ignored: bool) -> Result<(), &'static str> {
@@ -818,20 +1063,27 @@ impl State {
 		Ok(())
 	}
 	pub(crate) fn pending_dm_muted(&self, channel: Id) -> Option<bool> {
-		match &self.user_actions.pending {
-			Some((
-				Action::Mute {
-					channel: target,
-					muted,
-				},
-				_,
-				false,
-			)) if *target == channel => Some(*muted),
-			_ => None,
-		}
+		self.user_actions
+			.coalesced
+			.desired(&CoalescedKey::Mute(channel))
+			.map(CoalescedValue::as_bool)
 	}
 	pub fn user_action_pending(&self) -> bool {
-		self.user_actions.pending.is_some()
+		!self.user_actions.coalesced.is_empty()
+			|| !self.user_actions.one_shots.is_empty()
+			|| self.user_actions.challenge.is_some()
+	}
+	pub fn dm_open_pending(&self) -> bool {
+		self.user_actions
+			.one_shots
+			.iter()
+			.any(|(key, _)| matches!(key, OneShotKey::OpenDm(_)))
+	}
+	pub fn group_create_pending(&self) -> bool {
+		self.user_actions
+			.one_shots
+			.iter()
+			.any(|(key, _)| matches!(key, OneShotKey::CreateGroup(_)))
 	}
 	pub fn user_action_status(&self) -> Option<&'static str> {
 		self.user_actions.status
@@ -856,7 +1108,12 @@ impl State {
 	}
 	/// Whether an explicit message action can open a DM with this loaded user.
 	pub fn can_open_user_dm(&self, user: &model::User) -> bool {
-		!user.webhook && !self.user_action_pending() && self.dm_target_allowed(user.id, false)
+		!user.webhook
+			&& !self
+				.user_actions
+				.one_shots
+				.contains(&OneShotKey::OpenDm(user.id))
+			&& self.dm_target_allowed(user.id, false)
 	}
 	/// Opens a DM with a loaded user, including people who are not friends.
 	pub fn open_user_dm(&mut self, user: &model::User) -> Option<Command> {
@@ -907,8 +1164,12 @@ impl State {
 		if let Some(channel) = self.existing_group(&people) {
 			return self.select(channel);
 		}
-		let command = self.request_user_action(Action::CreateGroup { recipients: people })?;
-		self.user_actions.group_origin = Some((self.selected, self.request));
+		let origin = (self.selected, self.request);
+		let command = self.request_one_shot(
+			Action::CreateGroup { recipients: people },
+			OneShotRollback::CreateGroup { origin },
+		)?;
+		self.user_actions.group_origin = Some(origin);
 		self.user_actions.created_group = None;
 		self.status = "Creating group message…";
 		Some(command)
@@ -942,8 +1203,10 @@ impl State {
 		if let Some(channel) = self.existing_dm(user) {
 			return self.select(channel);
 		}
-		let command = self.request_user_action(Action::OpenDm(user))?;
-		self.user_actions.dm_origin = Some((self.selected, self.request, friend_only));
+		let origin = (self.selected, self.request, friend_only);
+		let command =
+			self.request_one_shot(Action::OpenDm(user), OneShotRollback::OpenDm { origin })?;
+		self.user_actions.dm_origin = Some(origin);
 		self.user_actions.opened_dm = None;
 		self.status = "Opening direct message…";
 		Some(command)
@@ -1013,30 +1276,556 @@ impl State {
 		self.channel(channel)
 			.is_some_and(|c| c.guild.is_none() && c.kind == 1 && c.recipients.len() == 1)
 	}
-	/// Queues one account write; only one may be pending at a time.
-	fn request_user_action(&mut self, action: Action) -> Option<Command> {
-		if self.user_action_pending() {
-			return None;
+	fn user_toast_label(&self, user: Id) -> String {
+		if let Some(nick) = self.user_actions.nicknames.get(&user)
+			&& !nick.is_empty()
+		{
+			return nick.clone();
 		}
+		if let Some((record, _)) = self.user_actions.friends.get(&user) {
+			return record.name.clone();
+		}
+		if let Some((record, _, _)) = self.user_actions.requests.get(&user) {
+			return record.name.clone();
+		}
+		if let Some((record, _, _)) = self.user_actions.restricted.get(&user) {
+			return record.name.clone();
+		}
+		if let Some(profile) = self.profile.as_ref().filter(|p| p.user == user)
+			&& let Some(data) = profile.data.as_ref()
+		{
+			return data.user.name.clone();
+		}
+		if let Some(found) = self
+			.channels
+			.iter()
+			.flat_map(|ch| &ch.recipients)
+			.find(|u| u.id == user)
+		{
+			return found.name.clone();
+		}
+		format!("user {user}")
+	}
+	fn lookup_user_record(&self, user: Id) -> (model::User, String) {
+		if let Some((record, name)) = self.user_actions.friends.get(&user) {
+			return (record.clone(), name.clone());
+		}
+		if let Some((record, name, _)) = self.user_actions.requests.get(&user) {
+			return (record.clone(), name.clone());
+		}
+		if let Some(profile) = self.profile.as_ref().filter(|p| p.user == user)
+			&& let Some(data) = profile.data.as_ref()
+		{
+			let username = if data.username.is_empty() {
+				data.user.name.clone()
+			} else {
+				data.username.clone()
+			};
+			return (data.user.clone(), username);
+		}
+		if let Some(found) = self
+			.channels
+			.iter()
+			.flat_map(|ch| &ch.recipients)
+			.find(|u| u.id == user)
+		{
+			return (found.clone(), found.name.clone());
+		}
+		(
+			model::User {
+				id: user,
+				name: "Unknown user".into(),
+				avatar: None,
+				discriminator: 0,
+				primary_guild: None,
+				cosmetics: None,
+				webhook: false,
+				kind: Default::default(),
+			},
+			format!("User ID: {user}"),
+		)
+	}
+	fn user_action_ready(&mut self) -> bool {
 		if !self.demo && (self.auth != AuthState::Authenticated || !self.gateway_connected) {
 			self.user_actions.status = Some("User actions unavailable while disconnected");
 			self.status = self.user_actions.status.unwrap();
+			return false;
+		}
+		true
+	}
+	fn request_one_shot(&mut self, action: Action, rollback: OneShotRollback) -> Option<Command> {
+		if !self.user_action_ready() {
 			return None;
 		}
-		self.user_actions.sequence = self.user_actions.sequence.wrapping_add(1);
-		let request = self.user_actions.sequence;
-		self.user_actions.pending = Some((action.clone(), request, false));
-		if matches!(action, Action::Block { .. }) {
-			self.user_actions.bump_view();
-		}
+		let key = action_one_shot_key(&action)?;
+		let label = match &action {
+			Action::AddFriend { username } => format!("@{username}"),
+			Action::ResolveFriend { user, .. }
+			| Action::ProfileFriend { user, .. }
+			| Action::OpenDm(user) => self.user_toast_label(*user),
+			Action::CloseDm(channel) | Action::MessageRequest { channel, .. } => {
+				self.channel_toast_label(*channel)
+			}
+			Action::CreateGroup { .. } => "group message".into(),
+			_ => String::new(),
+		};
+		let entry = OneShotEntry {
+			action: action.clone(),
+			label,
+			observed: false,
+			pending_friendship: match action {
+				Action::ResolveFriend { user, accept: true }
+				| Action::ProfileFriend {
+					user,
+					friend: false,
+				} => Some((user, self.user_actions.friends.contains_key(&user))),
+				_ => None,
+			},
+			rollback,
+		};
+		let seq = match self.user_actions.one_shots.insert(key, entry) {
+			Ok(seq) => seq,
+			Err(crate::optimistic::InsertError::Duplicate(_)) => return None,
+			Err(crate::optimistic::InsertError::Full(_)) => {
+				self.user_actions.status =
+					Some("Too many user actions in flight; try again shortly");
+				return None;
+			}
+		};
 		self.user_actions.status = None;
 		Some(Command::UserAction {
 			action,
-			request,
+			request: seq,
 			captcha: None,
 		})
 	}
-	/// Aborts the pending account write and reports an unknown outcome.
+	/// Queues one optimistic user action on either `CoalescedSlot` (idempotent toggles/edits)
+	/// or `InFlightSet` (concurrent one-shot transitions).
+	fn request_user_action(&mut self, action: Action) -> Option<Command> {
+		if !self.user_action_ready() {
+			return None;
+		}
+		if let Some(key) = action_coalesced_key(&action) {
+			let (baseline, desired, label) = match &action {
+				Action::Block { user, blocked } => (
+					CoalescedValue::Bool(self.confirmed_user_blocked(*user).unwrap_or(!*blocked)),
+					CoalescedValue::Bool(*blocked),
+					self.user_toast_label(*user),
+				),
+				Action::Ignore { user, ignored } => (
+					CoalescedValue::Bool(self.confirmed_user_ignored(*user).unwrap_or(!*ignored)),
+					CoalescedValue::Bool(*ignored),
+					self.user_toast_label(*user),
+				),
+				Action::Mute { channel, muted } => (
+					CoalescedValue::Bool(self.confirmed_dm_muted(*channel).unwrap_or(!*muted)),
+					CoalescedValue::Bool(*muted),
+					self.channel_toast_label(*channel),
+				),
+				Action::Note { user, text } => (
+					CoalescedValue::Text(
+						self.user_actions
+							.note
+							.as_ref()
+							.filter(|(id, _)| id == user)
+							.map(|(_, t)| t.clone())
+							.unwrap_or_default(),
+					),
+					CoalescedValue::Text(text.clone()),
+					self.user_toast_label(*user),
+				),
+				Action::Nickname { user, text } => (
+					CoalescedValue::Text(
+						self.user_actions
+							.nicknames
+							.get(user)
+							.cloned()
+							.unwrap_or_default(),
+					),
+					CoalescedValue::Text(text.clone()),
+					self.user_toast_label(*user),
+				),
+				_ => unreachable!(),
+			};
+			let outcome = self.user_actions.coalesced.set(key, baseline, desired);
+			if outcome != crate::optimistic::SetOutcome::Full
+				&& matches!(key, CoalescedKey::Note(_) | CoalescedKey::Nickname(_))
+			{
+				self.user_actions
+					.failed_contact_edits
+					.retain(|(target, _)| *target != key);
+			}
+			match outcome {
+				crate::optimistic::SetOutcome::Full => {
+					self.user_actions.status =
+						Some("Too many pending settings updates; wait a moment");
+					return None;
+				}
+				crate::optimistic::SetOutcome::Queued { cancel_in_flight } => {
+					if matches!(key, CoalescedKey::Mute(_)) {
+						self.revision = self.revision.wrapping_add(1);
+					} else {
+						self.user_actions.bump_view();
+					}
+					self.user_actions.status = None;
+					return cancel_in_flight.map(|request| Command::CancelPendingWrite {
+						kind: crate::optimistic::WriteKind::UserAction,
+						request,
+					});
+				}
+				crate::optimistic::SetOutcome::Dispatch(seq) => {
+					self.user_actions.coalesced_labels.insert(key, label);
+					self.user_actions.coalesced_observed.remove(&key);
+					if matches!(key, CoalescedKey::Mute(_)) {
+						self.revision = self.revision.wrapping_add(1);
+					} else {
+						self.user_actions.bump_view();
+					}
+					self.user_actions.status = None;
+					return Some(Command::UserAction {
+						action,
+						request: seq,
+						captcha: None,
+					});
+				}
+			}
+		}
+		// One-shot optimistic transitions.
+		match action {
+			Action::AddFriend { username } => {
+				let rollback = OneShotRollback::AddFriend {
+					username: username.clone(),
+				};
+				let cmd = self.request_one_shot(
+					Action::AddFriend {
+						username: username.clone(),
+					},
+					rollback,
+				)?;
+				self.user_actions
+					.failed_add_friends
+					.retain(|failed| *failed != username);
+				self.user_actions.bump_view();
+				Some(cmd)
+			}
+			Action::ResolveFriend { user, accept } => {
+				let entry = self.user_actions.requests.get(&user)?.clone();
+				let rollback = OneShotRollback::ResolveFriend {
+					user,
+					entry: entry.clone(),
+					accept,
+				};
+				let cmd =
+					self.request_one_shot(Action::ResolveFriend { user, accept }, rollback)?;
+				self.user_actions.requests.remove(&user);
+				if accept {
+					self.user_actions.friends.insert(user, (entry.0, entry.1));
+				}
+				self.user_actions.bump_view();
+				self.revision = self.revision.wrapping_add(1);
+				Some(cmd)
+			}
+			Action::ProfileFriend { user, friend } => {
+				if friend {
+					let (record, name) = self.lookup_user_record(user);
+					let rollback = OneShotRollback::ProfileFriend {
+						user,
+						friend: true,
+						inserted_request: true,
+						removed_friend: None,
+					};
+					let cmd = self
+						.request_one_shot(Action::ProfileFriend { user, friend: true }, rollback)?;
+					self.user_actions
+						.requests
+						.insert(user, (record, name, false));
+					self.user_actions.bump_view();
+					self.revision = self.revision.wrapping_add(1);
+					Some(cmd)
+				} else {
+					let removed = self.user_actions.friends.get(&user).cloned();
+					let nick = self.user_actions.nicknames.get(&user).cloned();
+					let since = self.user_actions.friends_since.get(&user).copied();
+					let rollback = OneShotRollback::ProfileFriend {
+						user,
+						friend: false,
+						inserted_request: false,
+						removed_friend: removed.map(|(u, n)| (u, n, nick, since)),
+					};
+					let cmd = self.request_one_shot(
+						Action::ProfileFriend {
+							user,
+							friend: false,
+						},
+						rollback,
+					)?;
+					self.user_actions.friends.remove(&user);
+					self.user_actions.nicknames.remove(&user);
+					self.user_actions.friends_since.remove(&user);
+					self.user_actions.bump_view();
+					self.revision = self.revision.wrapping_add(1);
+					Some(cmd)
+				}
+			}
+			Action::CloseDm(channel) => {
+				let snapshot = self.channel(channel).cloned().map(Box::new);
+				let rollback = OneShotRollback::CloseDm { channel: snapshot };
+				let cmd = self.request_one_shot(Action::CloseDm(channel), rollback)?;
+				self.channels.retain(|ch| ch.id != channel);
+				self.invalidate_navigation();
+				if self.selected == Some(channel) {
+					self.arrived_home();
+				}
+				self.revision = self.revision.wrapping_add(1);
+				Some(cmd)
+			}
+			Action::MessageRequest { channel, accept } => {
+				let removed_channel = (!accept)
+					.then(|| self.channel(channel).cloned().map(Box::new))
+					.flatten();
+				let rollback = OneShotRollback::MessageRequest {
+					channel,
+					accept,
+					removed_channel,
+				};
+				let cmd =
+					self.request_one_shot(Action::MessageRequest { channel, accept }, rollback)?;
+				self.user_actions.message_requests.remove(&channel);
+				if !accept {
+					self.channels.retain(|ch| ch.id != channel);
+					self.invalidate_navigation();
+					if self.selected == Some(channel) {
+						self.arrived_home();
+					}
+				}
+				self.user_actions.bump_view();
+				self.revision = self.revision.wrapping_add(1);
+				Some(cmd)
+			}
+			Action::OpenDm(user) => {
+				let origin = (self.selected, self.request, false);
+				self.request_one_shot(Action::OpenDm(user), OneShotRollback::OpenDm { origin })
+			}
+			Action::CreateGroup { recipients } => {
+				let origin = (self.selected, self.request);
+				self.request_one_shot(
+					Action::CreateGroup { recipients },
+					OneShotRollback::CreateGroup { origin },
+				)
+			}
+			Action::LoadNote(_)
+			| Action::Block { .. }
+			| Action::Ignore { .. }
+			| Action::Mute { .. }
+			| Action::Note { .. }
+			| Action::Nickname { .. } => None,
+		}
+	}
+	fn commit_coalesced_user_action(
+		&mut self,
+		key: CoalescedKey,
+		confirmed: CoalescedValue,
+	) -> Result<(), &'static str> {
+		match key {
+			CoalescedKey::Note(user) => {
+				if let Some((target, _, obs)) = &mut self.user_actions.note_request
+					&& *target == user
+				{
+					*obs = true;
+				}
+				if self
+					.user_actions
+					.note
+					.as_ref()
+					.is_none_or(|(id, _)| *id == user)
+				{
+					self.user_actions.note = Some((user, confirmed.into_text()));
+				}
+			}
+			CoalescedKey::Nickname(user) => {
+				self.apply_user_action(Event::Nickname {
+					user,
+					text: confirmed.into_text(),
+				})?;
+			}
+			CoalescedKey::Block(user) => {
+				self.store_relationship(user, confirmed.as_bool())?;
+			}
+			CoalescedKey::Ignore(user) => {
+				let ignored = confirmed.as_bool();
+				let profile = self.user_actions.friends.get(&user).cloned().or_else(|| {
+					self.user_actions
+						.requests
+						.get(&user)
+						.map(|(u, n, _)| (u.clone(), n.clone()))
+				});
+				self.apply_user_action(Event::Restriction {
+					user,
+					ignored: ignored.then_some(true),
+					profile,
+				})?;
+			}
+			CoalescedKey::Mute(channel) => {
+				self.confirm_dm_muted(channel, confirmed.as_bool())?;
+			}
+		}
+		Ok(())
+	}
+	fn rollback_one_shot(&mut self, entry: OneShotEntry, failure: Option<Failure>) {
+		let label = entry.label;
+		let toast_failure = failure.filter(|f| !f.ends_session() || *f == Failure::Capacity);
+		match entry.rollback {
+			OneShotRollback::AddFriend { username } => {
+				if self
+					.user_actions
+					.requests
+					.values()
+					.any(|(_, name, incoming)| !*incoming && *name == username)
+				{
+					return;
+				}
+				if let Some(failure) = toast_failure {
+					self.push_write_error(ActionKind::AddFriend, format!("@{username}"), failure);
+				}
+				let drafts = &mut self.user_actions.failed_add_friends;
+				if drafts.len() >= crate::optimistic::MAX_IN_FLIGHT {
+					drafts.pop_front();
+				}
+				drafts.push_back(username);
+			}
+			OneShotRollback::ResolveFriend {
+				user,
+				entry: prior,
+				accept,
+			} => {
+				if !entry.observed {
+					if accept {
+						self.user_actions.friends.remove(&user);
+					}
+					self.user_actions.requests.entry(user).or_insert(prior);
+				}
+				if let Some(failure) = toast_failure {
+					let action = if accept {
+						ActionKind::AcceptFriendRequest
+					} else {
+						ActionKind::DeclineFriendRequest
+					};
+					self.push_write_error(action, label, failure);
+				}
+			}
+			OneShotRollback::ProfileFriend {
+				user,
+				friend,
+				inserted_request,
+				removed_friend,
+			} => {
+				if !entry.observed {
+					if inserted_request {
+						self.user_actions.requests.remove(&user);
+					}
+					if let Some((record, name, nick, since)) = removed_friend {
+						self.user_actions
+							.friends
+							.entry(user)
+							.or_insert((record, name));
+						if let Some(nick) = nick {
+							self.user_actions.nicknames.entry(user).or_insert(nick);
+						}
+						if let Some(since) = since {
+							self.user_actions.friends_since.entry(user).or_insert(since);
+						}
+					}
+				}
+				if let Some(failure) = toast_failure {
+					let action = if friend {
+						ActionKind::AddFriend
+					} else {
+						ActionKind::RemoveFriend
+					};
+					self.push_write_error(action, label, failure);
+				}
+			}
+			OneShotRollback::CloseDm { channel } => {
+				if !entry.observed
+					&& let Some(ch) = channel
+					&& self.channel(ch.id).is_none()
+					&& self.channels.len() < crate::MAX_NAV
+				{
+					self.channels.push(*ch);
+					self.invalidate_navigation();
+				}
+				if let Some(failure) = toast_failure {
+					self.push_write_error(ActionKind::CloseDm, label, failure);
+				}
+			}
+			OneShotRollback::MessageRequest {
+				channel,
+				accept,
+				removed_channel,
+			} => {
+				if !entry.observed {
+					self.user_actions.message_requests.insert(channel);
+					if let Some(ch) = removed_channel
+						&& self.channel(ch.id).is_none()
+						&& self.channels.len() < crate::MAX_NAV
+					{
+						self.channels.push(*ch);
+						self.invalidate_navigation();
+					}
+				}
+				if let Some(failure) = toast_failure {
+					let action = if accept {
+						ActionKind::AcceptMessageRequest
+					} else {
+						ActionKind::IgnoreMessageRequest
+					};
+					self.push_write_error(action, label, failure);
+				}
+			}
+			OneShotRollback::OpenDm { .. } => {
+				self.user_actions.dm_origin = None;
+				self.user_actions.opened_dm = None;
+				if let Some(failure) = toast_failure {
+					self.push_write_error(ActionKind::OpenDm, label, failure);
+				}
+			}
+			OneShotRollback::CreateGroup { .. } => {
+				self.user_actions.group_origin = None;
+				self.user_actions.created_group = None;
+				if let Some(failure) = toast_failure {
+					self.push_write_error(ActionKind::CreateGroup, "", failure);
+				}
+			}
+		}
+		self.user_actions.bump_view();
+		self.revision = self.revision.wrapping_add(1);
+	}
+	/// Handles a confirmed pre-wire cancellation of a superseded coalesced user action.
+	pub(crate) fn cancel_user_action_pre_wire(&mut self, request: u64) {
+		let Some((key, outcome)) = self.user_actions.coalesced.cancelled_by_seq(request) else {
+			return;
+		};
+		match outcome {
+			crate::optimistic::Cancelled::Stale => {}
+			crate::optimistic::Cancelled::Settled => {
+				self.user_actions.coalesced_labels.remove(&key);
+				self.user_actions.coalesced_observed.remove(&key);
+				if matches!(key, CoalescedKey::Block(_) | CoalescedKey::Nickname(_)) {
+					self.user_actions.bump_view();
+				}
+				self.revision = self.revision.wrapping_add(1);
+			}
+			crate::optimistic::Cancelled::DispatchFollowUp { seq, value } => {
+				self.user_actions.coalesced_observed.remove(&key);
+				self.push_follow_up(Command::UserAction {
+					action: coalesced_action(key, value),
+					request: seq,
+					captcha: None,
+				});
+			}
+		}
+	}
+	/// Aborts all pending account writes on disconnect and rolls back optimistic overlays.
 	pub(crate) fn cancel_user_action(&mut self) {
 		self.cancel_user_note_read();
 		self.user_actions.dm_origin = None;
@@ -1044,30 +1833,57 @@ impl State {
 		self.user_actions.group_origin = None;
 		self.user_actions.created_group = None;
 		self.user_actions.challenge = None;
-		if let Some((action, _, _)) = self.user_actions.pending.take() {
-			if matches!(action, Action::Block { .. }) {
-				self.user_actions.bump_view();
+		let coalesced = self.user_actions.coalesced.cancel_all();
+		let had_coalesced = !coalesced.is_empty();
+		for (key, entry) in coalesced {
+			if matches!(key, CoalescedKey::Note(_) | CoalescedKey::Nickname(_))
+				&& entry.desired != entry.confirmed
+			{
+				self.user_actions
+					.keep_failed_contact_edit(key, entry.desired.into_text());
 			}
+		}
+		self.user_actions.coalesced_labels.clear();
+		self.user_actions.coalesced_observed.clear();
+		let one_shots = self.user_actions.one_shots.cancel_all();
+		let had_any = had_coalesced || !one_shots.is_empty();
+		for (_, entry) in one_shots {
+			self.rollback_one_shot(entry, None);
+		}
+		if had_any {
+			self.user_actions.bump_view();
 			self.user_actions.status =
 				Some("Outcome unknown · check the official client before retrying");
+			self.revision = self.revision.wrapping_add(1);
 		}
 	}
 	pub(crate) fn observe_dm_reopened(&mut self, channel: Id) {
-		if let Some((Action::CloseDm(target), _, observed)) = &mut self.user_actions.pending
-			&& *target == channel
+		if let Some(entry) = self
+			.user_actions
+			.one_shots
+			.get_mut(&OneShotKey::CloseDm(channel))
 		{
-			*observed = true;
+			entry.observed = true;
 		}
 	}
 	pub(crate) fn observe_dm_settings(&mut self, event: &crate::notifications::Event) {
-		if let Some((Action::Mute { .. }, _, observed)) = &mut self.user_actions.pending {
-			*observed |= match event {
-				crate::notifications::Event::Invalidate => true,
-				crate::notifications::Event::Settings { entries, replace } => {
-					*replace || entries.iter().any(|s| s.guild.is_none())
-				}
-				_ => false,
-			};
+		let affects_dm = match event {
+			crate::notifications::Event::Invalidate => true,
+			crate::notifications::Event::Settings { entries, replace } => {
+				*replace || entries.iter().any(|s| s.guild.is_none())
+			}
+			_ => false,
+		};
+		if affects_dm {
+			let keys: Vec<CoalescedKey> = self
+				.user_actions
+				.coalesced
+				.iter()
+				.filter_map(|(k, _)| matches!(k, CoalescedKey::Mute(_)).then_some(*k))
+				.collect();
+			for key in keys {
+				self.user_actions.coalesced_observed.insert(key);
+			}
 		}
 	}
 	/// Applies one account-action event to relationship and challenge state.
@@ -1091,10 +1907,22 @@ impl State {
 				request,
 				result,
 			} => {
-				if !matches!(&self.user_actions.pending, Some((Action::OpenDm(id), sequence, _)) if *id == user && *sequence == request)
-				{
+				let key = OneShotKey::OpenDm(user);
+				let Some(entry) = self.user_actions.one_shots.finish(&key, request) else {
 					return Ok(());
+				};
+				if self
+					.user_actions
+					.challenge
+					.as_ref()
+					.is_some_and(|(ck, _, seq, _, _)| *ck == key && *seq == request)
+				{
+					self.user_actions.challenge = None;
 				}
+				let origin = match entry.rollback {
+					OneShotRollback::OpenDm { origin } => origin,
+					_ => (self.selected, self.request, false),
+				};
 				let result = result.and_then(|channel| {
 					if channel.id.0 == 0
 						|| channel.guild.is_some()
@@ -1110,12 +1938,7 @@ impl State {
 								|| known.recipients[0].webhook
 						}) {
 						Err(Failure::Ambiguous)
-					} else if self
-						.user_actions
-						.dm_origin
-						.is_none_or(|(_, _, friend_only)| {
-							!self.dm_target_allowed(user, friend_only)
-						}) {
+					} else if !self.dm_target_allowed(user, origin.2) {
 						Err(Failure::Forbidden)
 					} else {
 						Ok(channel)
@@ -1124,14 +1947,14 @@ impl State {
 				let channel = match result {
 					Ok(channel) => channel,
 					Err(failure) => {
-						return self.apply_user_action(Event::Written {
-							action: Action::OpenDm(user),
-							request,
-							result: Err(failure),
-						});
+						self.rollback_one_shot(entry, Some(failure));
+						if failure.ends_session() && failure != Failure::Capacity {
+							self.status = failure.label();
+							self.fail(failure);
+						}
+						return Ok(());
 					}
 				};
-				self.user_actions.pending = None;
 				let id = channel.id;
 				// Preserve newer Gateway metadata; otherwise use the normal navigation bounds.
 				if self.channel(id).is_none() {
@@ -1140,7 +1963,8 @@ impl State {
 						event: crate::Event::ChannelCreated(*channel),
 					});
 				}
-				if self.channel(id).is_some() && self.user_actions.dm_origin.is_some() {
+				if self.channel(id).is_some() {
+					self.user_actions.dm_origin = Some(origin);
 					self.user_actions.opened_dm = Some((id, user));
 					self.user_actions.status = None;
 					self.status = "Direct message opened";
@@ -1151,13 +1975,14 @@ impl State {
 				recipients,
 				result,
 			} => {
-				if !matches!(
-					&self.user_actions.pending,
-					Some((Action::CreateGroup { recipients: sent }, sequence, _))
-						if *sent == recipients && *sequence == request
-				) {
+				let key = OneShotKey::CreateGroup(recipients.clone());
+				let Some(entry) = self.user_actions.one_shots.finish(&key, request) else {
 					return Ok(());
-				}
+				};
+				let origin = match entry.rollback {
+					OneShotRollback::CreateGroup { origin } => origin,
+					_ => (self.selected, self.request),
+				};
 				let result = result.and_then(|channel| {
 					let holds_everyone = recipients
 						.iter()
@@ -1181,14 +2006,14 @@ impl State {
 				let channel = match result {
 					Ok(channel) => channel,
 					Err(failure) => {
-						return self.apply_user_action(Event::Written {
-							action: Action::CreateGroup { recipients },
-							request,
-							result: Err(failure),
-						});
+						self.rollback_one_shot(entry, Some(failure));
+						if failure.ends_session() && failure != Failure::Capacity {
+							self.status = failure.label();
+							self.fail(failure);
+						}
+						return Ok(());
 					}
 				};
-				self.user_actions.pending = None;
 				let id = channel.id;
 				if self.channel(id).is_none() {
 					self.apply(crate::Envelope {
@@ -1196,7 +2021,8 @@ impl State {
 						event: crate::Event::ChannelCreated(*channel),
 					});
 				}
-				if self.channel(id).is_some() && self.user_actions.group_origin.is_some() {
+				if self.channel(id).is_some() {
+					self.user_actions.group_origin = Some(origin);
 					self.user_actions.created_group = Some(id);
 					self.user_actions.status = None;
 					self.status = "Group message opened";
@@ -1213,11 +2039,12 @@ impl State {
 					*observed = true;
 					active = true;
 				}
-				if let Some((Action::Note { user: target, .. }, _, observed)) =
-					&mut self.user_actions.pending
-					&& *target == user
-				{
-					*observed = true;
+				let note_key = CoalescedKey::Note(user);
+				if self.user_actions.coalesced.entry(&note_key).is_some() {
+					self.user_actions
+						.coalesced
+						.observe_authoritative(&note_key, CoalescedValue::Text(text.clone()));
+					self.user_actions.coalesced_observed.insert(note_key);
 					active = true;
 				}
 				if active {
@@ -1275,11 +2102,12 @@ impl State {
 				if user.0 == 0 || !valid_personal_text(&text, true) {
 					return Err("Invalid friend nickname");
 				}
-				if let Some((Action::Nickname { user: target, .. }, _, observed)) =
-					&mut self.user_actions.pending
-					&& *target == user
-				{
-					*observed = true;
+				let nick_key = CoalescedKey::Nickname(user);
+				if self.user_actions.coalesced.entry(&nick_key).is_some() {
+					self.user_actions
+						.coalesced
+						.observe_authoritative(&nick_key, CoalescedValue::Text(text.clone()));
+					self.user_actions.coalesced_observed.insert(nick_key);
 				}
 				if text.is_empty() || !self.user_actions.friends.contains_key(&user) {
 					self.user_actions.nicknames.remove(&user);
@@ -1296,10 +2124,17 @@ impl State {
 				}
 			}
 			Event::Requests(entries) => {
-				if let Some((Action::ProfileFriend { .. }, _, observed)) =
-					&mut self.user_actions.pending
-				{
-					*observed = true;
+				let profile_keys: Vec<OneShotKey> = self
+					.user_actions
+					.one_shots
+					.iter()
+					.filter(|&(k, _)| matches!(k, OneShotKey::ProfileFriend(_)))
+					.map(|(k, _)| k.clone())
+					.collect();
+				for key in profile_keys {
+					if let Some(entry) = self.user_actions.one_shots.get_mut(&key) {
+						entry.observed = true;
+					}
 				}
 				self.user_actions.requests.clear();
 				self.user_actions.requests_known = false;
@@ -1334,15 +2169,18 @@ impl State {
 				if user.0 == 0 {
 					return Err("Invalid friend request");
 				}
-				if let Some((
-					Action::ResolveFriend { user: target, .. }
-					| Action::ProfileFriend { user: target, .. },
-					_,
-					observed,
-				)) = &mut self.user_actions.pending
-					&& *target == user
-				{
-					*observed = true;
+				let resolve_already_observed = self
+					.user_actions
+					.one_shots
+					.get(&OneShotKey::ResolveFriend(user))
+					.is_some_and(|e| e.observed);
+				for key in [
+					OneShotKey::ResolveFriend(user),
+					OneShotKey::ProfileFriend(user),
+				] {
+					if let Some(entry) = self.user_actions.one_shots.get_mut(&key) {
+						entry.observed = true;
+					}
 				}
 				if let Some(incoming) = incoming {
 					let profile = profile.or_else(|| {
@@ -1389,6 +2227,16 @@ impl State {
 						entry.2 = incoming;
 					}
 				} else {
+					if let Some(entry) = self
+						.user_actions
+						.one_shots
+						.get(&OneShotKey::ResolveFriend(user))
+						&& !resolve_already_observed
+						&& matches!(entry.action, Action::ResolveFriend { accept: true, .. })
+					{
+						self.user_actions.friends.remove(&user);
+						self.user_actions.bump_view();
+					}
 					self.user_actions.spam_requests.remove(&user);
 					if let Some((_, name, _)) = self.user_actions.requests.remove(&user)
 						&& self.user_actions.last_requested.as_deref() == Some(&name)
@@ -1407,8 +2255,14 @@ impl State {
 						profile: Some(profile.clone()),
 					})?;
 				}
-				if self.user_actions.friends.contains_key(&profile.0.id) {
-					let user = profile.0.id;
+				let user = profile.0.id;
+				if self.user_actions.friends.contains_key(&user)
+					&& self
+						.user_actions
+						.one_shots
+						.get(&OneShotKey::ResolveFriend(user))
+						.is_none_or(|entry| entry.pending_friendship.is_none())
+				{
 					self.apply_user_action(Event::Friend {
 						user,
 						friend: true,
@@ -1418,18 +2272,43 @@ impl State {
 				}
 			}
 			Event::Friends(entries) => {
-				if let Some((Action::ProfileFriend { .. }, _, observed)) =
-					&mut self.user_actions.pending
-				{
-					*observed = true;
+				let profile_keys: Vec<OneShotKey> = self
+					.user_actions
+					.one_shots
+					.iter()
+					.filter(|&(k, entry)| {
+						matches!(k, OneShotKey::ProfileFriend(_))
+							|| entry.pending_friendship.is_some()
+					})
+					.map(|(k, _)| k.clone())
+					.collect();
+				let mut pending_friendships = BTreeMap::new();
+				for key in profile_keys {
+					if let Some(entry) = self.user_actions.one_shots.get_mut(&key) {
+						entry.observed = true;
+						if let Some((user, previous_membership)) = entry.pending_friendship.take() {
+							pending_friendships.insert(user, previous_membership);
+						}
+					}
 				}
 				// Profile Privacy depends on friendship: drop cached profiles of anyone the
 				// snapshot adds or removes, including when it is rejected or unknown.
 				let previous = std::mem::take(&mut self.user_actions.friends);
 				let result = self.replace_friends(entries);
 				let friends = &self.user_actions.friends;
-				let changed = |user: &Id| previous.contains_key(user) != friends.contains_key(user);
-				if previous.keys().chain(friends.keys()).any(changed) {
+				let changed = |user: &Id| {
+					pending_friendships
+						.get(user)
+						.copied()
+						.unwrap_or_else(|| previous.contains_key(user))
+						!= friends.contains_key(user)
+				};
+				if previous
+					.keys()
+					.chain(friends.keys())
+					.chain(pending_friendships.keys())
+					.any(changed)
+				{
 					// A profile preload in flight may carry the old friendship's view.
 					self.preload.profiles.touch(None);
 				}
@@ -1438,9 +2317,7 @@ impl State {
 					.as_ref()
 					.map(|view| view.user)
 					.filter(|user| changed(user));
-				self.profile_cache.retain_users(|user| {
-					previous.contains_key(&user) == friends.contains_key(&user)
-				});
+				self.profile_cache.retain_users(|user| !changed(&user));
 				if let Some(user) = open {
 					self.refresh_open_profile(user);
 				}
@@ -1451,18 +2328,23 @@ impl State {
 				friend,
 				profile,
 			} => {
-				// Profile Privacy depends on friendship, so a cached, preloading or open profile may
-				// now be stale.
-				if self.user_actions.friends.contains_key(&user) != friend {
-					self.profile_cache.forget(user);
-					self.preload.profiles.touch(None);
-					self.refresh_open_profile(user);
+				let mut previous_membership = None;
+				for key in [
+					OneShotKey::ProfileFriend(user),
+					OneShotKey::ResolveFriend(user),
+				] {
+					if let Some(entry) = self.user_actions.one_shots.get_mut(&key) {
+						entry.observed = true;
+						if let Some((_, was_friend)) = entry.pending_friendship.take() {
+							previous_membership = Some(was_friend);
+						}
+					}
 				}
-				if let Some((Action::ProfileFriend { user: target, .. }, _, observed)) =
-					&mut self.user_actions.pending
-					&& *target == user
+				if previous_membership
+					.unwrap_or_else(|| self.user_actions.friends.contains_key(&user))
+					!= friend
 				{
-					*observed = true;
+					self.invalidate_profile_for_friendship_change(user);
 				}
 				let profile = profile.or_else(|| {
 					self.user_actions
@@ -1471,11 +2353,9 @@ impl State {
 						.map(|(u, n, _)| (u.clone(), n.clone()))
 				});
 				if !friend {
-					if let Some((Action::Nickname { user: target, .. }, _, observed)) =
-						&mut self.user_actions.pending
-						&& *target == user
-					{
-						*observed = true;
+					let nick_key = CoalescedKey::Nickname(user);
+					if self.user_actions.coalesced.entry(&nick_key).is_some() {
+						self.user_actions.coalesced_observed.insert(nick_key);
 					}
 					self.user_actions.friends.remove(&user);
 					self.user_actions.nicknames.remove(&user);
@@ -1505,6 +2385,7 @@ impl State {
 						return Err("Friends exceed safe capacity");
 					}
 					entries.insert(user, (record, name));
+					self.user_actions.requests.remove(&user);
 				}
 			}
 			Event::Restrictions(entries) => {
@@ -1548,11 +2429,13 @@ impl State {
 				ignored,
 				profile,
 			} => {
-				if let Some((Action::Ignore { user: target, .. }, _, observed)) =
-					&mut self.user_actions.pending
-					&& *target == user
-				{
-					*observed = true;
+				let ign_key = CoalescedKey::Ignore(user);
+				if self.user_actions.coalesced.entry(&ign_key).is_some() {
+					self.user_actions.coalesced.observe_authoritative(
+						&ign_key,
+						CoalescedValue::Bool(ignored.unwrap_or(false)),
+					);
+					self.user_actions.coalesced_observed.insert(ign_key);
 				}
 				let Some(ignored) = ignored else {
 					self.store_ignored(user, false)?;
@@ -1592,8 +2475,14 @@ impl State {
 				self.store_ignored(user, ignored)?;
 			}
 			Event::Relationships(entries) => {
-				if let Some((Action::Block { .. }, _, observed)) = &mut self.user_actions.pending {
-					*observed = true;
+				let block_keys: Vec<CoalescedKey> = self
+					.user_actions
+					.coalesced
+					.iter()
+					.filter_map(|(k, _)| matches!(k, CoalescedKey::Block(_)).then_some(*k))
+					.collect();
+				for key in block_keys {
+					self.user_actions.coalesced_observed.insert(key);
 				}
 				self.user_actions.relationships.clear();
 				self.user_actions.known = false;
@@ -1629,6 +2518,13 @@ impl State {
 				self.user_actions.bump_view();
 			}
 			Event::MessageRequest { channel, pending } => {
+				if let Some(entry) = self
+					.user_actions
+					.one_shots
+					.get_mut(&OneShotKey::MessageRequest(channel))
+				{
+					entry.observed = true;
+				}
 				self.set_message_request(channel, pending)?;
 			}
 			Event::MessageSpams(entries) => {
@@ -1657,14 +2553,19 @@ impl State {
 			}
 			Event::Relationship { user, blocked } => {
 				self.store_relationship(user, blocked)?;
-				if let Some((
-					Action::Block { user: target, .. } | Action::ProfileFriend { user: target, .. },
-					_,
-					observed,
-				)) = &mut self.user_actions.pending
-					&& *target == user
+				let blk_key = CoalescedKey::Block(user);
+				if self.user_actions.coalesced.entry(&blk_key).is_some() {
+					self.user_actions
+						.coalesced
+						.observe_authoritative(&blk_key, CoalescedValue::Bool(blocked));
+					self.user_actions.coalesced_observed.insert(blk_key);
+				}
+				if let Some(entry) = self
+					.user_actions
+					.one_shots
+					.get_mut(&OneShotKey::ProfileFriend(user))
 				{
-					*observed = true;
+					entry.observed = true;
 				}
 			}
 			Event::Challenge {
@@ -1672,14 +2573,40 @@ impl State {
 				request,
 				challenge,
 			} => {
-				let Some((pending, sequence, _)) = &self.user_actions.pending else {
+				let Some(key) = action_one_shot_key(&action) else {
 					return Ok(());
 				};
-				if *pending != action || *sequence != request || !challengeable(&action) {
+				if !challengeable(&action) {
+					return Ok(());
+				}
+				// Verify this exact one-shot attempt is active with matching sequence.
+				let matches = self.user_actions.one_shots.seq(&key) == Some(request)
+					&& self
+						.user_actions
+						.one_shots
+						.get(&key)
+						.is_some_and(|entry| entry.action == action);
+				if !matches {
+					return Ok(());
+				}
+				if self.user_actions.challenge.as_ref().is_some_and(
+					|(active_key, _, active_seq, _, _)| {
+						*active_key != key || *active_seq != request
+					},
+				) {
+					if let Some(entry) = self.user_actions.one_shots.finish(&key, request) {
+						self.rollback_one_shot(
+							entry,
+							Some(Failure::ProtocolAt(
+								"Finish the active verification check first",
+							)),
+						);
+					}
 					return Ok(());
 				}
 				self.user_actions.status = None;
-				self.user_actions.challenge = Some((std::time::Instant::now(), *challenge));
+				self.user_actions.challenge =
+					Some((key, action, request, std::time::Instant::now(), *challenge));
 			}
 			Event::Written {
 				action,
@@ -1693,119 +2620,148 @@ impl State {
 						result: Err(result.err().unwrap_or(Failure::Protocol)),
 					});
 				}
-				let Some((pending, sequence, observed)) = &self.user_actions.pending else {
+				if let Some(key) = action_coalesced_key(&action) {
+					let contact_draft = if result.is_err()
+						&& matches!(key, CoalescedKey::Note(_) | CoalescedKey::Nickname(_))
+					{
+						self.user_actions.coalesced.entry(&key).and_then(|entry| {
+							(entry.desired != entry.confirmed)
+								.then(|| entry.desired.as_text().to_owned())
+						})
+					} else {
+						None
+					};
+					let finish = self.user_actions.coalesced.finish(&key, request, result);
+					match finish {
+						crate::optimistic::Finish::Stale => return Ok(()),
+						crate::optimistic::Finish::Settled { confirmed } => {
+							let observed = self.user_actions.coalesced_observed.remove(&key);
+							self.user_actions.coalesced_labels.remove(&key);
+							if !observed {
+								self.commit_coalesced_user_action(key, confirmed)?;
+							}
+							if matches!(key, CoalescedKey::Mute(_)) {
+								self.revision = self.revision.wrapping_add(1);
+							} else {
+								self.user_actions.bump_view();
+							}
+							self.user_actions.status = None;
+						}
+						crate::optimistic::Finish::DispatchFollowUp { seq, value } => {
+							let observed = self.user_actions.coalesced_observed.remove(&key);
+							if !observed
+								&& let Some(confirmed) = self
+									.user_actions
+									.coalesced
+									.entry(&key)
+									.map(|e| e.confirmed.clone())
+							{
+								self.commit_coalesced_user_action(key, confirmed)?;
+							}
+							self.user_actions.coalesced_observed.remove(&key);
+							self.push_follow_up(Command::UserAction {
+								action: coalesced_action(key, value),
+								request: seq,
+								captcha: None,
+							});
+						}
+						crate::optimistic::Finish::RolledBack { failure, .. } => {
+							if let Some(draft) = contact_draft {
+								self.user_actions.keep_failed_contact_edit(key, draft);
+							}
+							self.user_actions.coalesced_observed.remove(&key);
+							let label = self
+								.user_actions
+								.coalesced_labels
+								.remove(&key)
+								.unwrap_or_else(|| "this user".into());
+							if matches!(key, CoalescedKey::Mute(_)) {
+								self.revision = self.revision.wrapping_add(1);
+							} else {
+								self.user_actions.bump_view();
+							}
+							if failure.ends_session() && failure != Failure::Capacity {
+								self.status = failure.label();
+								self.fail(failure);
+							} else {
+								let action = match key {
+									CoalescedKey::Block(_) => ActionKind::Block,
+									CoalescedKey::Ignore(_) => ActionKind::Ignore,
+									CoalescedKey::Mute(_) => ActionKind::Mute,
+									CoalescedKey::Note(_) => ActionKind::SaveNote,
+									CoalescedKey::Nickname(_) => ActionKind::SaveNickname,
+								};
+								self.push_write_error(action, label, failure);
+							}
+						}
+					}
+					return Ok(());
+				}
+				let Some(key) = action_one_shot_key(&action) else {
 					return Ok(());
 				};
-				if *pending != action || *sequence != request {
+				let Some(entry) = self.user_actions.one_shots.finish(&key, request) else {
 					return Ok(());
-				}
-				let observed = *observed;
-				self.user_actions.pending = None;
-				self.user_actions.challenge = None;
-				if matches!(action, Action::OpenDm(_)) {
-					self.user_actions.dm_origin = None;
-				}
-				if matches!(action, Action::CreateGroup { .. }) {
-					self.user_actions.group_origin = None;
-					self.user_actions.created_group = None;
-				}
-				if matches!(action, Action::Block { .. }) {
-					self.user_actions.bump_view();
+				};
+				if self
+					.user_actions
+					.challenge
+					.as_ref()
+					.is_some_and(|(ck, _, seq, _, _)| *ck == key && *seq == request)
+				{
+					self.user_actions.challenge = None;
 				}
 				if let Err(failure) = result {
-					if failure.ends_session() {
+					self.rollback_one_shot(entry, Some(failure));
+					if failure.ends_session() && failure != Failure::Capacity {
 						self.status = failure.label();
 						self.fail(failure);
 					}
 					return Ok(());
 				}
-				if !observed {
-					match action {
-						Action::LoadNote(_) | Action::OpenDm(_) | Action::CreateGroup { .. } => {}
-						Action::Note { user, ref text } => {
-							if let Some((target, _, observed)) = &mut self.user_actions.note_request
-								&& *target == user
-							{
-								*observed = true;
-							}
-							self.user_actions.note = Some((user, text.clone()))
-						}
-						Action::Nickname { user, ref text } => {
-							self.apply_user_action(Event::Nickname {
-								user,
-								text: text.clone(),
-							})?;
-						}
-						Action::AddFriend { ref username } => {
-							self.user_actions.last_requested = Some(username.clone())
-						}
-						Action::ResolveFriend { user, accept } => {
-							if let Some((record, name, _)) =
-								self.user_actions.requests.remove(&user)
-							{
-								self.user_actions.last_requested = None;
-								if accept {
-									self.apply_user_action(Event::Friend {
-										user,
-										friend: true,
-										profile: Some((record, name)),
-									})?;
-								}
-							}
-						}
-						Action::ProfileFriend { user, friend } => {
-							if friend {
-								self.apply_user_action(Event::Request {
-									user,
-									incoming: Some(false),
-									profile: None,
-								})?;
-							} else {
-								self.apply_user_action(Event::Friend {
-									user,
-									friend: false,
-									profile: None,
-								})?;
-							}
-						}
-						Action::CloseDm(channel) => {
+				if let Some((user, was_friend)) = entry.pending_friendship
+					&& self.user_actions.friends.contains_key(&user) != was_friend
+				{
+					self.invalidate_profile_for_friendship_change(user);
+				}
+				self.user_actions.status = None;
+				match action {
+					Action::AddFriend { username } => {
+						self.user_actions.last_requested = Some(username);
+					}
+					Action::ResolveFriend { .. } => {
+						self.user_actions.last_requested = None;
+					}
+					Action::CloseDm(channel) => {
+						if !entry.observed {
 							self.remove_channels(&std::collections::BTreeSet::from([channel]));
-							if self.selected == Some(channel) {
-								self.arrived_home();
-							}
-						}
-						Action::Block { user, blocked } => {
-							self.store_relationship(user, blocked)?
-						}
-						Action::Ignore { user, ignored } => {
-							let profile =
-								self.user_actions.friends.get(&user).cloned().or_else(|| {
-									self.user_actions
-										.requests
-										.get(&user)
-										.map(|(u, n, _)| (u.clone(), n.clone()))
-								});
-							self.apply_user_action(Event::Restriction {
-								user,
-								ignored: ignored.then_some(true),
-								profile,
-							})?;
-						}
-						Action::Mute { channel, muted } => self.confirm_dm_muted(channel, muted)?,
-						Action::MessageRequest { channel, accept } => {
-							self.set_message_request(channel, false)?;
-							if !accept {
-								self.remove_channels(&std::collections::BTreeSet::from([channel]));
-								if self.selected == Some(channel) {
-									self.arrived_home();
-								}
-							}
 						}
 					}
+					Action::MessageRequest { channel, accept } => {
+						if !accept && !entry.observed {
+							self.remove_channels(&std::collections::BTreeSet::from([channel]));
+						}
+					}
+					Action::OpenDm(_) => {
+						// OpenDm returning Written(Ok) means Discord didn't return a channel object;
+						// treat as ambiguous and release origin.
+						self.rollback_one_shot(entry, Some(Failure::Ambiguous));
+					}
+					Action::CreateGroup { .. } => {
+						self.rollback_one_shot(entry, Some(Failure::Ambiguous));
+					}
+					_ => {}
 				}
+				self.user_actions.bump_view();
+				self.revision = self.revision.wrapping_add(1);
 			}
 		}
 		Ok(())
+	}
+	fn invalidate_profile_for_friendship_change(&mut self, user: Id) {
+		self.profile_cache.forget(user);
+		self.preload.profiles.touch(None);
+		self.refresh_open_profile(user);
 	}
 	fn store_relationship(&mut self, user: Id, blocked: bool) -> Result<(), &'static str> {
 		self.user_actions.bump_view();
@@ -2400,6 +3356,22 @@ mod tests {
 	}
 
 	#[test]
+	fn disconnect_retains_the_latest_contact_draft_only_for_this_account() {
+		let mut state = state();
+		let user = Id(2);
+		state.user_actions.note = Some((user, "Original".into()));
+		assert!(state.set_user_note(user, "First draft".into()).is_some());
+		assert!(state.set_user_note(user, "Latest draft".into()).is_some());
+
+		state.cancel_user_action();
+		state.user_actions.reset(); // The same account received a fresh READY.
+		assert_eq!(state.failed_contact_edit(user, false), Some("Latest draft"));
+		assert_eq!(state.failed_contact_edit(user, true), None);
+		state.logout();
+		assert_eq!(state.failed_contact_edit(user, false), None);
+	}
+
+	#[test]
 	fn personal_edits_are_bounded_confirmed_and_reconcile_newer_service_state() {
 		{
 			let mut state = state();
@@ -2436,9 +3408,14 @@ mod tests {
 				.unwrap();
 			finish(&mut state, write, Err(Failure::Forbidden));
 			assert_eq!(state.user_note(user.id), Some("Newest note"));
+			assert_eq!(
+				state.failed_contact_edit(user.id, false),
+				Some("Private draft")
+			);
 			let write = state.set_user_note(user.id, String::new()).unwrap();
 			finish(&mut state, write, Ok(()));
 			assert_eq!(state.user_note(user.id), Some(""));
+			assert_eq!(state.failed_contact_edit(user.id, false), None);
 			assert!(!valid_personal_text(&"🌙".repeat(257), false));
 			assert!(!valid_personal_text("bad\nname", true));
 			assert!(valid_personal_text(&"🌙".repeat(32), true));
@@ -2501,7 +3478,8 @@ mod tests {
 			let block = state.set_user_blocked(Id(2), true).unwrap();
 			assert_eq!(state.user_blocked(Id(2)), Some(true));
 			assert_eq!(state.user_action_status(), None);
-			assert!(state.close_dm(Id(10)).is_none());
+			// Duplicate identical block is a no-op; unrelated targets stay unblocked.
+			assert!(state.set_user_blocked(Id(2), true).is_none());
 			finish(&mut state, block, Err(Failure::Forbidden));
 			assert!(!state.user_action_pending());
 			assert_eq!(state.user_blocked(Id(2)), None);
@@ -2589,8 +3567,9 @@ mod tests {
 				.unwrap();
 			finish(&mut state, unmute, Ok(()));
 			assert_eq!(state.dm_muted(Id(10)), Some(false));
-			let close = state.close_dm(Id(10)).unwrap();
 			let channel = state.channel(Id(10)).unwrap().clone();
+			let close = state.close_dm(Id(10)).unwrap();
+			assert!(state.channel(Id(10)).is_none());
 			state.apply(Envelope {
 				generation: state.generation,
 				event: CoreEvent::Unavailable(Id(10)),
@@ -2645,8 +3624,9 @@ mod tests {
 			assert!(state.add_friend("../invalid").is_none());
 			let send = state.add_friend(" @new_friend ").unwrap();
 			assert!(state.add_friend("new_friend").is_none());
-			assert!(state.resolve_friend_request(user.id, true).is_none());
+			assert_eq!(state.optimistic_outgoing_requests(), vec!["new_friend"]);
 			finish(&mut state, send, Ok(()));
+			assert!(state.optimistic_outgoing_requests().is_empty());
 			assert_eq!(state.user_action_status(), None);
 			assert!(state.add_friend("new_friend").is_none());
 			assert_eq!(
@@ -2748,7 +3728,7 @@ mod tests {
 			assert!(state.add_profile_friend(Id(1)).is_none());
 			let add = state.add_profile_friend(user.id).unwrap();
 			assert!(state.add_profile_friend(user.id).is_none());
-			assert_eq!(state.pending_friends().count(), 0);
+			assert_eq!(state.pending_friends().count(), 1);
 			finish(&mut state, add, Err(Failure::Forbidden));
 			assert_eq!(state.pending_friends().count(), 0);
 			let add = state.add_profile_friend(user.id).unwrap();
@@ -2777,7 +3757,7 @@ mod tests {
 				})
 				.unwrap();
 			let remove = state.remove_friend(user.id).unwrap();
-			assert_eq!(state.friends().count(), 1);
+			assert_eq!(state.friends().count(), 0);
 			finish(&mut state, remove, Err(Failure::Forbidden));
 			assert_eq!(state.friends().count(), 1);
 			let remove = state.remove_friend(user.id).unwrap();
@@ -3061,6 +4041,10 @@ mod tests {
 			});
 			state.cancel_account_challenge(request);
 			assert!(state.account_challenge().is_none() && !state.user_action_pending());
+			assert_eq!(
+				state.take_failed_add_friend().as_deref(),
+				Some("synthetic_friend")
+			);
 			// Expiry releases the pending write so the user can send it again.
 			let Some(Command::UserAction {
 				action, request, ..
@@ -3076,10 +4060,115 @@ mod tests {
 					challenge: Box::new(challenge()),
 				}),
 			});
-			state.user_actions.challenge.as_mut().unwrap().0 =
+			state.user_actions.challenge.as_mut().unwrap().3 =
 				std::time::Instant::now() - crate::captcha::LIFETIME;
 			state.expire_account_challenge();
 			assert!(state.account_challenge().is_none() && !state.user_action_pending());
+			assert_eq!(
+				state.take_failed_add_friend().as_deref(),
+				Some("synthetic_friend")
+			);
 		}
+	}
+
+	#[test]
+	fn optimistic_user_actions_coalesce_run_concurrently_and_rollback_with_toasts() {
+		let mut state = state();
+		let dm_id = Id(10);
+		let u2 = Id(2);
+		let u3 = Id(3);
+		let mut u2_user = state.channels[0].recipients[0].clone();
+		u2_user.id = u2;
+		u2_user.name = "Two".into();
+		let mut u3_user = u2_user.clone();
+		u3_user.id = u3;
+		u3_user.name = "Three".into();
+		state
+			.apply_user_action(Event::Relationships(Some(vec![])))
+			.unwrap();
+		state
+			.apply_user_action(Event::Requests(Some(vec![
+				(u2_user, "two".into(), true),
+				(u3_user, "three".into(), true),
+			])))
+			.unwrap();
+
+		// Two friend resolutions can run concurrently without blocking each other.
+		let accept_u2 = state.resolve_friend_request(u2, true).unwrap();
+		let decline_u3 = state.resolve_friend_request(u3, false).unwrap();
+		assert_eq!(state.pending_friends().count(), 0);
+		assert!(state.friend(u2).is_some());
+
+		// Failure on u2 rolls back u2 without disturbing u3 and emits an action error toast.
+		finish(&mut state, accept_u2, Err(Failure::Forbidden));
+		assert!(state.friend(u2).is_none());
+		assert_eq!(state.pending_friends().count(), 1);
+		let errors = state.take_action_errors();
+		assert_eq!(errors.len(), 1);
+		assert!(errors[0].target.contains("Two"));
+		finish(&mut state, decline_u3, Ok(()));
+		assert_eq!(state.pending_friends().count(), 1);
+
+		// AddFriend failure clears optimistic outgoing row, restores username for UI, and toasts.
+		let add = state.add_friend("alice_99").unwrap();
+		assert_eq!(state.optimistic_outgoing_requests(), vec!["alice_99"]);
+		finish(&mut state, add, Err(Failure::RateLimited));
+		assert!(state.optimistic_outgoing_requests().is_empty());
+		assert_eq!(state.take_failed_add_friend().as_deref(), Some("alice_99"));
+		assert_eq!(state.take_action_errors().len(), 1);
+
+		// Rapid Block -> Unblock emits a pre-wire cancel and settles cleanly when cancelled.
+		let block = state.set_user_blocked(u2, true).unwrap();
+		let Command::UserAction {
+			request: block_seq, ..
+		} = block
+		else {
+			panic!("expected user action command");
+		};
+		assert_eq!(state.user_blocked(u2), Some(true));
+		let cancel = state.set_user_blocked(u2, false).unwrap();
+		assert!(matches!(
+			cancel,
+			Command::CancelPendingWrite {
+				kind: crate::optimistic::WriteKind::UserAction,
+				request,
+			} if request == block_seq
+		));
+		assert_eq!(state.user_blocked(u2), Some(false));
+		state.apply(Envelope {
+			generation: state.generation,
+			event: CoreEvent::WriteCancelled {
+				kind: crate::optimistic::WriteKind::UserAction,
+				request: block_seq,
+			},
+		});
+		assert_eq!(state.user_blocked(u2), Some(false));
+		assert!(state.take_follow_up_commands().is_empty());
+
+		// CloseDm failure restores the channel and emits an error toast.
+		let close = state.close_dm(dm_id).unwrap();
+		assert!(state.channel(dm_id).is_none());
+		finish(&mut state, close, Err(Failure::Network));
+		assert!(state.channel(dm_id).is_some());
+		assert_eq!(state.take_action_errors().len(), 1);
+
+		// Coalesced Nickname write #1 -> write #2 commits write #2 cleanly when settled.
+		let accept_u2_ok = state.resolve_friend_request(u2, true).unwrap();
+		finish(&mut state, accept_u2_ok, Ok(()));
+		let nick1 = state.set_friend_nickname(u2, "First".into()).unwrap();
+		assert_eq!(state.friend_nickname(u2), Some("First"));
+		assert!(matches!(
+			state.set_friend_nickname(u2, "Second".into()),
+			Some(Command::CancelPendingWrite {
+				kind: crate::optimistic::WriteKind::UserAction,
+				..
+			})
+		));
+		assert_eq!(state.friend_nickname(u2), Some("Second"));
+		finish(&mut state, nick1, Ok(()));
+		let follow_ups = state.take_follow_up_commands();
+		assert_eq!(follow_ups.len(), 1);
+		finish(&mut state, follow_ups.into_iter().next().unwrap(), Ok(()));
+		assert_eq!(state.friend_nickname(u2), Some("Second"));
 	}
 }

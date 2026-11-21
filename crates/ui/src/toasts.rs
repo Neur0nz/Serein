@@ -7,8 +7,13 @@
 //!
 //! Colours, icons and severities come from [`crate::design`], so a toast and an inline
 //! [`crate::design::notice`] read as the same message in two places.
-use crate::{design, icons};
+use crate::{design, i18n, icons};
+use client_core::{
+	auth::Failure,
+	optimistic::{ActionError, ActionKind, MAX_ACTION_ERRORS},
+};
 use egui::{Align2, Stroke};
+use std::collections::VecDeque;
 
 /// How long a toast rests on screen once drawn. Problems outlast pleasantries.
 fn lifetime(level: design::Level) -> f64 {
@@ -45,10 +50,88 @@ struct Toast {
 #[derive(Default)]
 pub struct Toasts {
 	items: Vec<Toast>,
+	pending_write_errors: VecDeque<String>,
 	next_id: u64,
 }
 
 impl Toasts {
+	pub fn push_write_error(&mut self, error: ActionError) {
+		let ActionError {
+			action,
+			target,
+			failure,
+		} = error;
+		let action = i18n::translate(match action {
+			ActionKind::AcceptFriendRequest => "friends-accept-request",
+			ActionKind::AcceptMessageRequest => "message-request-accept",
+			ActionKind::AddFriend => "friends-send-request",
+			ActionKind::Block => "profiles-more-menu-block",
+			ActionKind::CloseDm => "user-menu-contents-close-dm",
+			ActionKind::CreateGroup => "new-message-title",
+			ActionKind::DeclineFriendRequest => "friends-decline-request",
+			ActionKind::DeleteMessage => "timeline-message-actions-delete-message",
+			ActionKind::DeleteServer => "server-settings-delete-dialog-delete-server",
+			ActionKind::EditMessage => "timeline-message-actions-edit-message",
+			ActionKind::Forward => "lib-debug-forward-check-forward-message",
+			ActionKind::ForwardNote => "action-write-forward-note",
+			ActionKind::Ignore => "profiles-ignore",
+			ActionKind::IgnoreMessageRequest => "message-request-ignore-tooltip",
+			ActionKind::LeaveGroup => "group-menu-menu-leave-group",
+			ActionKind::LeaveServer => "server-menu-show-leave-server-2",
+			ActionKind::MarkRead => "channel-menu-context-mark-as-read",
+			ActionKind::Mute => "group-menu-menu-mute-conversation",
+			ActionKind::OpenDm => "friends-message",
+			ActionKind::PinMessage => "timeline-message-actions-pin-message",
+			ActionKind::Poll => "action-write-poll",
+			ActionKind::PollVote => "polls-card-vote",
+			ActionKind::PrivacySetting => "page-messaging-permissions",
+			ActionKind::Reaction => "channel-permissions-add-add-reactions",
+			ActionKind::RemoveFriend => "profiles-more-menu-remove-friend",
+			ActionKind::RenameGroup | ActionKind::UpdateGroup => "group-menu-menu-edit-group",
+			ActionKind::SaveFolders => "guild-folders-server-folders-folder-settings",
+			ActionKind::SaveNickname => "contact-editor-show-friend-nickname",
+			ActionKind::SaveNote => "profiles-more-menu-add-note",
+			ActionKind::SendInvite => "server-invite-picker-invite",
+			ActionKind::UnpinMessage => "timeline-message-actions-unpin-message",
+			ActionKind::UpdateChannel => "channel-menu-context-edit-channel",
+			ActionKind::UpdateServer => "server-menu-settings-item-server-settings",
+			ActionKind::UpdateServerNotifications => "channel-menu-context-notification-settings",
+		});
+		let reason = i18n::translate(match failure {
+			Failure::Forbidden => "action-write-forbidden",
+			Failure::RateLimited => "action-write-rate-limited",
+			Failure::Network => "action-write-network",
+			Failure::Ambiguous => "action-write-ambiguous",
+			Failure::Capacity | Failure::CapacityAt(_) => "action-write-busy",
+			_ => "action-write-rejected",
+		});
+		let action = action.trim_end_matches('…');
+		let notice = if target.is_empty() {
+			i18n::translate_args(
+				"action-write-failed",
+				&[("action", action), ("reason", &reason)],
+			)
+		} else {
+			i18n::translate_args(
+				"action-write-failed-for",
+				&[("action", action), ("target", &target), ("reason", &reason)],
+			)
+		};
+		if self.items.len() < MAX
+			|| self
+				.items
+				.iter()
+				.any(|toast| toast.level == design::Level::Error && toast.text == notice)
+		{
+			self.push(design::Level::Error, notice);
+		} else if !self.pending_write_errors.contains(&notice) {
+			if self.pending_write_errors.len() == MAX_ACTION_ERRORS {
+				self.pending_write_errors.pop_front();
+			}
+			self.pending_write_errors.push_back(notice);
+		}
+	}
+
 	/// States `text` briefly. Repeating a notice that is still on screen restarts its
 	/// deadline rather than stacking a copy, so a repeated failure reads as one event.
 	pub fn push(&mut self, level: design::Level, text: impl Into<String>) {
@@ -76,6 +159,11 @@ impl Toasts {
 	/// Draws the live toasts stacked under the window chrome. `top` is the inset that
 	/// clears whatever the caller draws above them.
 	pub fn show(&mut self, ctx: &egui::Context, top: f32) {
+		while self.items.len() < MAX
+			&& let Some(notice) = self.pending_write_errors.pop_front()
+		{
+			self.push(design::Level::Error, notice);
+		}
 		if self.items.is_empty() {
 			return;
 		}
@@ -175,7 +263,10 @@ impl Toasts {
 			.filter_map(|toast| toast.deadline)
 			.map(|deadline| deadline - FADE - now)
 			.fold(f64::INFINITY, f64::min);
-		if appearing || fade_in <= 0.0 {
+		if appearing
+			|| fade_in <= 0.0
+			|| (self.items.len() < MAX && !self.pending_write_errors.is_empty())
+		{
 			ctx.request_repaint();
 		} else if fade_in.is_finite() {
 			ctx.request_repaint_after(std::time::Duration::from_secs_f64(fade_in));

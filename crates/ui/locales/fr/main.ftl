@@ -4940,3 +4940,15 @@ moderation-confirm-ban = Bannir
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Ce module n'a encore rien à afficher.
+
+# Optimistic write feedback
+action-write-failed = Échec de l’action « { $action } ». { $reason }
+action-write-failed-for = Échec de l’action « { $action } » pour { $target }. { $reason }
+action-write-forward-note = Envoyer la note de transfert
+action-write-poll = Sondage
+action-write-forbidden = Autorisation refusée.
+action-write-rate-limited = Attendez un instant avant de réessayer.
+action-write-network = Échec de la connexion.
+action-write-ambiguous = Le résultat est inconnu. Vérifiez Discord avant de réessayer.
+action-write-busy = Trop de modifications sont en attente. Réessayez dans un instant.
+action-write-rejected = Discord a refusé la modification ou renvoyé une réponse inattendue.

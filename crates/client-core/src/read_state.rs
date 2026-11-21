@@ -1,9 +1,24 @@
+use crate::optimistic::ActionKind;
 use crate::{
 	State,
 	auth::{AuthState, Failure},
+	optimistic::{Cancelled, CoalescedSlot, Finish, SetOutcome, WriteKind},
 };
 use model::{Freshness, Id, Patch};
 use std::collections::BTreeMap;
+
+const MAX_CHANNEL_READ_WRITES: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChannelAckTarget {
+	message: Id,
+	manual: bool,
+	mention_count: Option<u32>,
+}
+struct ChannelAckMeta {
+	epoch: u64,
+	channel_label: String,
+}
 
 pub enum Event {
 	Snapshot {
@@ -49,24 +64,55 @@ impl Event {
 			}
 	}
 }
+type BulkAckTarget = (Id, u64, Id);
+
+struct BulkAckChannels {
+	/// A forgotten channel leaves its position empty so `acked` still lines up.
+	ordered: Vec<Option<BulkAckTarget>>,
+	positions: BTreeMap<Id, usize>,
+}
+
+impl BulkAckChannels {
+	fn new(channels: Vec<BulkAckTarget>) -> Self {
+		let positions = channels
+			.iter()
+			.enumerate()
+			.map(|(position, &(channel, _, _))| (channel, position))
+			.collect();
+		Self {
+			ordered: channels.into_iter().map(Some).collect(),
+			positions,
+		}
+	}
+
+	fn get(&self, channel: Id) -> Option<&BulkAckTarget> {
+		self.ordered[*self.positions.get(&channel)?].as_ref()
+	}
+
+	fn get_mut(&mut self, channel: Id) -> Option<&mut BulkAckTarget> {
+		self.ordered[*self.positions.get(&channel)?].as_mut()
+	}
+
+	fn forget(&mut self, channel: Id) {
+		if let Some(position) = self.positions.remove(&channel) {
+			self.ordered[position] = None;
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.positions.is_empty()
+	}
+}
+
 enum Pending {
-	Channel {
-		channel: Id,
-		message: Id,
-		request: u64,
-		epoch: u64,
-		manual: bool,
-		mention_count: Option<u32>,
-	},
 	Guild {
 		guild: Id,
 		request: u64,
-		channels: Vec<(Id, u64, Id)>,
+		channels: BulkAckChannels,
 	},
 	All {
 		request: u64,
-		/// In request order; a forgotten channel leaves `None` so `acked` still lines up.
-		channels: Vec<Option<(Id, u64, Id)>>,
+		channels: BulkAckChannels,
 		scope: Scope,
 		/// More unread channels remained past `MAX_BULK_ACK`.
 		more: bool,
@@ -107,6 +153,8 @@ pub struct ReadState {
 	known: bool,
 	version: Option<u64>,
 	revision: u64,
+	channel_writes: CoalescedSlot<Id, ChannelAckTarget, MAX_CHANNEL_READ_WRITES>,
+	channel_meta: BTreeMap<Id, ChannelAckMeta>,
 	pending: Option<Pending>,
 	/// A capped or reconnect-interrupted bulk acknowledgement asks for its next batch.
 	continue_all: Option<Scope>,
@@ -124,20 +172,81 @@ impl ReadState {
 	pub(crate) fn busy(&self) -> bool {
 		self.pending.is_some()
 	}
+	pub fn has_fast_pending(&self) -> bool {
+		!self.channel_writes.is_empty() || self.pending.is_some()
+	}
+	fn optimistic_bulk_marker(&self, channel: Id, current_epoch: u64) -> Option<Id> {
+		let (Pending::Guild { channels, .. } | Pending::All { channels, .. }) =
+			self.pending.as_ref()?;
+		let &(_, epoch, message) = channels.get(channel)?;
+		(epoch == current_epoch).then_some(message)
+	}
+	fn optimistic_marker(&self, channel: Id) -> Option<Option<Id>> {
+		let entry = self.channel_writes.entry(&channel);
+		if entry.is_none() && self.pending.is_none() {
+			return None;
+		}
+		let (confirmed, current_epoch) = self.entries.get(&channel).copied().unwrap_or_default();
+		if let Some(entry) = entry
+			&& self
+				.channel_meta
+				.get(&channel)
+				.is_some_and(|m| m.epoch == current_epoch)
+		{
+			let target = &entry.desired;
+			return Some(if target.manual {
+				Some(target.message)
+			} else {
+				Some(target.message).max(confirmed)
+			});
+		}
+		self.optimistic_bulk_marker(channel, current_epoch)
+			.map(|message| Some(message).max(confirmed))
+	}
+	pub(crate) fn optimistic_count(&self, channel: Id, latest: Option<Id>) -> Option<u32> {
+		let entry = self.channel_writes.entry(&channel);
+		if entry.is_none() && self.pending.is_none() {
+			return None;
+		}
+		let current_epoch = self.entries.get(&channel).map_or(0, |(_, e)| *e);
+		if let Some(entry) = entry
+			&& self
+				.channel_meta
+				.get(&channel)
+				.is_some_and(|m| m.epoch == current_epoch)
+		{
+			let target = &entry.desired;
+			return if target.manual {
+				target.mention_count
+			} else if latest.is_none_or(|l| target.message >= l) {
+				Some(0)
+			} else {
+				None
+			};
+		}
+		self.optimistic_bulk_marker(channel, current_epoch)
+			.filter(|&message| latest.is_none_or(|latest| message >= latest))
+			.map(|_| 0)
+	}
 	pub fn status(&self, channel: Id) -> Option<&'static str> {
 		self.status
 			.filter(|(id, _)| *id == channel)
 			.map(|(_, text)| text)
 	}
 	pub fn reset(&mut self) {
+		let mut channel_writes = std::mem::take(&mut self.channel_writes);
+		let _ = channel_writes.cancel_all();
 		*self = Self {
 			revision: self.revision.wrapping_add(1),
+			channel_writes,
 			..Self::default()
 		};
 	}
 	/// Drops pending work; an interrupted bulk acknowledgement resumes once reads can start again.
 	pub fn cancel(&mut self) {
 		self.activity.clear_notifications();
+		let _ = self.channel_writes.cancel_all();
+		self.channel_meta.clear();
 		if let Some(Pending::All { scope, .. }) = self.pending.take() {
 			self.continue_all = Some(scope);
 		}
@@ -146,29 +255,27 @@ impl ReadState {
 	pub fn forget(&mut self, channel: Id) {
 		self.entries.remove(&channel);
 		self.activity.forget(channel);
+		self.channel_meta.remove(&channel);
+		if let Some((seq, _)) = self
+			.channel_writes
+			.entry(&channel)
+			.and_then(|e| e.in_flight.as_ref())
+			.map(|(seq, _)| (*seq, ()))
+		{
+			let _ = self
+				.channel_writes
+				.finish(&channel, seq, Err(Failure::Protocol));
+		}
 		if self.status(channel).is_some() {
 			self.status = None;
 		}
-		let cancel = match self.pending.as_mut() {
-			Some(Pending::Channel {
-				channel: pending, ..
-			}) => *pending == channel,
-			Some(Pending::Guild { channels, .. }) => {
-				channels.retain(|(id, ..)| *id != channel);
-				channels.is_empty()
+		if let Some(Pending::Guild { channels, .. } | Pending::All { channels, .. }) =
+			&mut self.pending
+		{
+			channels.forget(channel);
+			if channels.is_empty() {
+				self.pending = None;
 			}
-			Some(Pending::All { channels, .. }) => {
-				for slot in channels.iter_mut() {
-					if slot.is_some_and(|(id, ..)| id == channel) {
-						*slot = None;
-					}
-				}
-				channels.iter().all(Option::is_none)
-			}
-			None => false,
-		};
-		if cancel {
-			self.cancel();
 		}
 	}
 }
@@ -181,6 +288,9 @@ impl State {
 				.is_some_and(|c| c.supports_text() || matches!(c.kind, 15 | 16))
 		{
 			return None;
+		}
+		if let Some(optimistic) = self.read_state.optimistic_marker(channel) {
+			return Some(optimistic);
 		}
 		(self.read_state.known || self.read_state.entries.contains_key(&channel)).then(|| {
 			self.read_state
@@ -200,10 +310,14 @@ impl State {
 		{
 			return None;
 		}
-		let read = match self.read_state.entries.get(&channel.id) {
-			Some((id, _)) => *id,
-			None if self.read_state.known && matches!(channel.kind, 10..=12) => None,
-			None => return None,
+		let read = if let Some(optimistic) = self.read_state.optimistic_marker(channel.id) {
+			optimistic
+		} else {
+			match self.read_state.entries.get(&channel.id) {
+				Some((id, _)) => *id,
+				None if self.read_state.known && matches!(channel.kind, 10..=12) => None,
+				None => return None,
+			}
 		};
 		let latest = channel.last_message?;
 		let unread = read.is_none_or(|read| latest > read);
@@ -385,7 +499,7 @@ impl State {
 			return None;
 		}
 		let channel = self.selected?;
-		Some(self.mark_read_command(channel, message, false, None))
+		self.mark_read_command(channel, message, false, None)
 	}
 	/// Explicit sidebar acknowledgement uses known channel metadata without navigating.
 	pub fn can_mark_channel_read(&self, channel: Id) -> bool {
@@ -399,7 +513,7 @@ impl State {
 			return None;
 		}
 		let message = self.channel(channel)?.last_message?;
-		Some(self.mark_read_command(channel, message, false, None))
+		self.mark_read_command(channel, message, false, None)
 	}
 	/// Leaving a channel acknowledges the latest message the reader had on screen there,
 	/// even when a short conversation never let them scroll toward the bottom.
@@ -421,7 +535,7 @@ impl State {
 		{
 			return None;
 		}
-		Some(self.mark_read_command(channel, message, false, None))
+		self.mark_read_command(channel, message, false, None)
 	}
 	pub fn can_mark_unread(&self, message: Id) -> bool {
 		self.auth == AuthState::Authenticated
@@ -450,7 +564,7 @@ impl State {
 		let mention_count = self
 			.private_loaded_unread_count(channel, cursor)
 			.or_else(|| self.loaded_guild_mentions(channel, cursor));
-		Some(self.mark_read_command(channel, cursor, true, mention_count))
+		self.mark_read_command(channel, cursor, true, mention_count)
 	}
 	fn private_loaded_unread_count(&self, channel: Id, after: Id) -> Option<u32> {
 		self.channel(channel)
@@ -507,17 +621,11 @@ impl State {
 		if echoed.is_some() {
 			return echoed;
 		}
-		if let Some(Pending::Channel {
-			channel: pending,
-			message,
-			manual: true,
-			mention_count,
-			..
-		}) = &self.read_state.pending
-			&& *pending == channel
-			&& after == Some(*message)
+		if let Some(entry) = self.read_state.channel_writes.entry(&channel)
+			&& entry.desired.manual
+			&& after == Some(entry.desired.message)
 		{
-			return *mention_count;
+			return entry.desired.mention_count;
 		}
 		if self
 			.channel(channel)
@@ -537,6 +645,7 @@ impl State {
 			&& self.gateway_connected
 			&& self.read_state.pending.is_none()
 			&& self.guilds.iter().any(|g| g.id == guild)
+			&& !self.has_queued_ack_in(|channel_guild| channel_guild == Some(guild))
 			&& self.channels.iter().any(|channel| {
 				channel.guild == Some(guild) && self.unread(channel.id) == Some(true)
 			})
@@ -557,9 +666,10 @@ impl State {
 		self.read_state.pending = Some(Pending::Guild {
 			guild,
 			request,
-			channels,
+			channels: BulkAckChannels::new(channels),
 		});
 		self.read_state.status = None;
+		self.revision += 1;
 		Some(crate::Command::MarkGuildRead { guild, request })
 	}
 	/// Unread channels in `scope` the account can see.
@@ -579,10 +689,26 @@ impl State {
 				Some((channel.id, epoch, message))
 			})
 	}
+	// The transport orders submitted ACKs. A coalesced intent hasn't joined that queue yet.
+	fn has_queued_ack_in(&self, covers: impl Fn(Option<Id>) -> bool) -> bool {
+		self.read_state
+			.channel_writes
+			.iter()
+			.any(|(channel, entry)| {
+				entry
+					.in_flight
+					.as_ref()
+					.is_some_and(|(_, sent)| sent != &entry.desired)
+					&& self
+						.channel(*channel)
+						.is_some_and(|known| covers(known.guild))
+			})
+	}
 	fn can_bulk_ack(&self, scope: &Scope) -> bool {
 		self.auth == AuthState::Authenticated
 			&& self.gateway_connected
 			&& self.read_state.pending.is_none()
+			&& !self.has_queued_ack_in(|guild| scope.covers(guild))
 			&& self.unread_acks(scope).next().is_some()
 	}
 	pub fn can_mark_all_read(&self) -> bool {
@@ -620,12 +746,13 @@ impl State {
 			.collect();
 		self.read_state.pending = Some(Pending::All {
 			request,
-			channels: channels.into_iter().map(Some).collect(),
+			channels: BulkAckChannels::new(channels),
 			scope,
 			more,
 		});
 		self.read_state.continue_all = None;
 		self.read_state.status = None;
+		self.revision += 1;
 		Some(crate::Command::MarkAllRead {
 			request,
 			channels: acks,
@@ -637,7 +764,7 @@ impl State {
 		if self.read_state.continue_all.is_none()
 			|| self.auth != AuthState::Authenticated
 			|| !self.gateway_connected
-			|| self.read_state.pending.is_some()
+			|| self.read_state.has_fast_pending()
 		{
 			return None;
 		}
@@ -660,35 +787,99 @@ impl State {
 			}) if *pending_guild == guild && *pending_request == request
 		)
 	}
+	pub(crate) fn cancel_read_state_pre_wire(&mut self, request: u64) {
+		let Some((channel, outcome)) = self.read_state.channel_writes.cancelled_by_seq(request)
+		else {
+			return;
+		};
+		match outcome {
+			Cancelled::Stale => {}
+			Cancelled::Settled => {
+				self.read_state.channel_meta.remove(&channel);
+				self.revision += 1;
+			}
+			Cancelled::DispatchFollowUp { seq, value } => {
+				if let Some(meta) = self.read_state.channel_meta.get_mut(&channel) {
+					meta.epoch = self.read_state.entries.get(&channel).map_or(0, |(_, e)| *e);
+				}
+				self.push_follow_up(crate::Command::MarkRead {
+					channel,
+					message: value.message,
+					request: seq,
+					manual: value.manual,
+					mention_count: value.mention_count,
+				});
+			}
+		}
+	}
 	pub(crate) fn mark_read_command(
 		&mut self,
 		channel: Id,
 		message: Id,
 		manual: bool,
 		mention_count: Option<u32>,
-	) -> crate::Command {
-		self.read_state.revision = self.read_state.revision.wrapping_add(1);
-		let request = self.read_state.revision;
+	) -> Option<crate::Command> {
 		let epoch = self
 			.read_state
 			.entries
 			.get(&channel)
 			.map_or(0, |(_, epoch)| *epoch);
-		self.read_state.pending = Some(Pending::Channel {
-			channel,
+		let confirmed_msg = self
+			.read_state
+			.entries
+			.get(&channel)
+			.and_then(|(id, _)| *id)
+			.unwrap_or(Id(0));
+		let confirmed = ChannelAckTarget {
+			message: confirmed_msg,
+			manual: false,
+			mention_count: None,
+		};
+		let desired = ChannelAckTarget {
 			message,
-			request,
-			epoch,
 			manual,
 			mention_count,
-		});
+		};
+		let label = self.channel_toast_label(channel);
+		let outcome = self
+			.read_state
+			.channel_writes
+			.set(channel, confirmed, desired);
 		self.read_state.status = None;
-		crate::Command::MarkRead {
-			channel,
-			message,
-			request,
-			manual,
-			mention_count,
+		match outcome {
+			SetOutcome::Full => None,
+			SetOutcome::Dispatch(seq) => {
+				self.read_state.channel_meta.insert(
+					channel,
+					ChannelAckMeta {
+						epoch,
+						channel_label: label,
+					},
+				);
+				self.revision += 1;
+				Some(crate::Command::MarkRead {
+					channel,
+					message,
+					request: seq,
+					manual,
+					mention_count,
+				})
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: Some(cancel_seq),
+			} => {
+				self.revision += 1;
+				Some(crate::Command::CancelPendingWrite {
+					kind: WriteKind::ReadState,
+					request: cancel_seq,
+				})
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: None,
+			} => {
+				self.revision += 1;
+				None
+			}
 		}
 	}
 	/// Advance the observed latest message ID for a channel and record read-state activity.
@@ -726,10 +917,13 @@ impl State {
 					self.read_state.reset();
 					return Err("Read-state capacity exceeded");
 				}
+				let mut channel_writes = std::mem::take(&mut self.read_state.channel_writes);
+				let _ = channel_writes.cancel_all();
 				self.read_state = ReadState {
 					revision: self.read_state.revision.wrapping_add(1),
 					known: entries.is_some() && !partial,
 					version,
+					channel_writes,
 					..ReadState::default()
 				};
 				for channel in &self.channels {
@@ -812,29 +1006,17 @@ impl State {
 							*epoch = revision;
 						}
 					};
-					match &mut self.read_state.pending {
-						Some(Pending::Channel {
-							channel: pending,
-							message: target,
-							epoch,
-							manual: false,
-							..
-						}) if *pending == channel => advance(epoch, *target),
-						Some(Pending::Guild { channels, .. }) => {
-							for (pending, epoch, target) in channels {
-								if *pending == channel {
-									advance(epoch, *target);
-								}
-							}
-						}
-						Some(Pending::All { channels, .. }) => {
-							for (pending, epoch, target) in channels.iter_mut().flatten() {
-								if *pending == channel {
-									advance(epoch, *target);
-								}
-							}
-						}
-						_ => {}
+					if let Some(entry) = self.read_state.channel_writes.entry(&channel)
+						&& !entry.desired.manual
+						&& let Some(meta) = self.read_state.channel_meta.get_mut(&channel)
+					{
+						advance(&mut meta.epoch, entry.desired.message);
+					}
+					if let Some(Pending::Guild { channels, .. } | Pending::All { channels, .. }) =
+						&mut self.read_state.pending
+						&& let Some((_, epoch, target)) = channels.get_mut(channel)
+					{
+						advance(epoch, *target);
 					}
 				}
 				if self.read_state.status(channel).is_some() {
@@ -867,36 +1049,36 @@ impl State {
 				request,
 				result,
 			} => {
-				let Some(Pending::Channel {
-					channel: pending_channel,
-					message: pending_message,
-					request: pending_request,
-					epoch,
-					manual,
-					mention_count,
-				}) = self.read_state.pending
-				else {
+				let Some(entry) = self.read_state.channel_writes.entry(&channel) else {
 					return Ok(());
 				};
-				if (channel, message, request)
-					!= (pending_channel, pending_message, pending_request)
-				{
+				let Some((in_flight_seq, in_flight_target)) = entry.in_flight.clone() else {
+					return Ok(());
+				};
+				if in_flight_seq != request {
 					return Ok(());
 				}
-				self.read_state.pending = None;
-				if !self.can_view(channel) {
-					self.read_state.status = None;
-					return Ok(());
-				}
-				match result {
-					Ok(()) => {
-						if self.channels.iter().any(|c| c.id == channel)
+				let in_flight_target = Some(in_flight_target);
+				let finish = self
+					.read_state
+					.channel_writes
+					.finish(&channel, request, result);
+				match finish {
+					Finish::Stale => return Ok(()),
+					Finish::Settled { confirmed } => {
+						let meta = self.read_state.channel_meta.remove(&channel);
+						if !self.can_view(channel) {
+							self.read_state.status = None;
+							return Ok(());
+						}
+						if let Some(meta) = meta
+							&& self.channels.iter().any(|c| c.id == channel)
 							&& self
 								.read_state
 								.entries
 								.get(&channel)
 								.map_or(0, |(_, epoch)| *epoch)
-								== epoch
+								== meta.epoch
 						{
 							self.read_state.revision = self.read_state.revision.wrapping_add(1);
 							let current = self
@@ -904,45 +1086,114 @@ impl State {
 								.entries
 								.get(&channel)
 								.and_then(|(id, _)| *id);
-							let next = if manual {
-								Some(message)
+							let next = if confirmed.manual {
+								Some(confirmed.message)
 							} else {
-								Some(message).max(current)
+								Some(confirmed.message).max(current)
 							};
-							if manual {
-								self.read_state.activity.ack(channel, next, mention_count);
+							if confirmed.manual {
+								self.read_state.activity.ack(
+									channel,
+									next,
+									confirmed.mention_count,
+								);
 							} else {
 								let latest = self.channel(channel).and_then(|c| c.last_message);
-								self.read_state.activity.ack_local(channel, message, latest);
+								self.read_state.activity.ack_local(
+									channel,
+									confirmed.message,
+									latest,
+								);
 							}
 							self.read_state
 								.entries
 								.insert(channel, (next, self.read_state.revision));
 						}
 						self.read_state.status = None;
+						self.revision += 1;
 					}
-					Err(failure) => {
-						if failure.ends_session() {
-							self.fail(failure);
-						} else if self
-							.read_state
-							.entries
-							.get(&channel)
-							.map_or(0, |(_, epoch)| *epoch)
-							== epoch
+					Finish::DispatchFollowUp { seq, value } => {
+						let meta_epoch =
+							self.read_state.channel_meta.get(&channel).map(|m| m.epoch);
+						if let Some(settled) = in_flight_target
+							&& let Some(epoch) = meta_epoch
+							&& self.channels.iter().any(|c| c.id == channel)
+							&& self.read_state.entries.get(&channel).map_or(0, |(_, e)| *e) == epoch
 						{
-							self.read_state.status = Some((
-								channel,
-								match failure {
-									Failure::Ambiguous => {
-										"Read status could not be confirmed · unread markers may be out of date"
-									}
-									_ => {
-										"Read status could not sync · unread markers may be out of date"
-									}
-								},
-							));
+							self.read_state.revision = self.read_state.revision.wrapping_add(1);
+							let current = self
+								.read_state
+								.entries
+								.get(&channel)
+								.and_then(|(id, _)| *id);
+							let next = if settled.manual {
+								Some(settled.message)
+							} else {
+								Some(settled.message).max(current)
+							};
+							if settled.manual {
+								self.read_state
+									.activity
+									.ack(channel, next, settled.mention_count);
+							} else {
+								let latest = self.channel(channel).and_then(|c| c.last_message);
+								self.read_state.activity.ack_local(
+									channel,
+									settled.message,
+									latest,
+								);
+							}
+							self.read_state
+								.entries
+								.insert(channel, (next, self.read_state.revision));
+							if let Some(meta) = self.read_state.channel_meta.get_mut(&channel) {
+								meta.epoch = self.read_state.revision;
+							}
 						}
+						self.push_follow_up(crate::Command::MarkRead {
+							channel,
+							message: value.message,
+							request: seq,
+							manual: value.manual,
+							mention_count: value.mention_count,
+						});
+					}
+					Finish::RolledBack { failure, .. } => {
+						let _ = message;
+						let meta = self.read_state.channel_meta.remove(&channel);
+						if !self.can_view(channel) {
+							self.read_state.status = None;
+							return Ok(());
+						}
+						if failure.ends_session() && failure != Failure::Capacity {
+							self.fail(failure);
+						} else {
+							let epoch_matches = meta.as_ref().is_some_and(|m| {
+								self.read_state
+									.entries
+									.get(&channel)
+									.map_or(0, |(_, epoch)| *epoch)
+									== m.epoch
+							});
+							if epoch_matches {
+								self.read_state.status = Some((
+									channel,
+									match failure {
+										Failure::Ambiguous => {
+											"Read status could not be confirmed · unread markers may be out of date"
+										}
+										_ => {
+											"Read status could not sync · unread markers may be out of date"
+										}
+									},
+								));
+							}
+							let label = meta
+								.map(|m| m.channel_label)
+								.unwrap_or_else(|| self.channel_toast_label(channel));
+							self.push_write_error(ActionKind::MarkRead, label, failure);
+						}
+						self.revision += 1;
 					}
 				}
 			}
@@ -965,7 +1216,7 @@ impl State {
 				let Some(Pending::Guild { channels, .. }) = self.read_state.pending.take() else {
 					return Ok(());
 				};
-				self.finish_bulk_ack(channels, result);
+				self.finish_bulk_ack(channels.ordered.into_iter().flatten(), result);
 			}
 			Event::AllAck {
 				request,
@@ -976,7 +1227,7 @@ impl State {
 					return Ok(());
 				}
 				let Some(Pending::All {
-					mut channels,
+					channels,
 					scope,
 					more,
 					..
@@ -984,12 +1235,13 @@ impl State {
 				else {
 					return Ok(());
 				};
-				let failed = channels.split_off(acked.min(channels.len()));
-				self.finish_bulk_ack(channels.into_iter().flatten().collect(), Ok(()));
+				let (confirmed, failed) =
+					channels.ordered.split_at(acked.min(channels.ordered.len()));
+				self.finish_bulk_ack(confirmed.iter().flatten().copied(), Ok(()));
 				match result {
 					Ok(()) => self.read_state.continue_all = more.then_some(scope),
 					Err(failure) => {
-						self.finish_bulk_ack(failed.into_iter().flatten().collect(), Err(failure))
+						self.finish_bulk_ack(failed.iter().flatten().copied(), Err(failure))
 					}
 				}
 			}
@@ -997,7 +1249,11 @@ impl State {
 		Ok(())
 	}
 	/// Confirm only channel epochs still belonging to this successful bulk request.
-	fn finish_bulk_ack(&mut self, channels: Vec<(Id, u64, Id)>, result: Result<(), Failure>) {
+	fn finish_bulk_ack(
+		&mut self,
+		mut channels: impl Iterator<Item = BulkAckTarget>,
+		result: Result<(), Failure>,
+	) {
 		match result {
 			Ok(()) => {
 				self.read_state.revision = self.read_state.revision.wrapping_add(1);
@@ -1024,13 +1280,14 @@ impl State {
 						.insert(channel, (Some(message), revision));
 				}
 				self.read_state.status = None;
+				self.revision += 1;
 			}
 			Err(failure) => {
-				if failure.ends_session() {
+				if failure.ends_session() && failure != Failure::Capacity {
 					self.fail(failure);
-				} else if let Some((channel, ..)) = channels.first() {
+				} else if let Some((channel, ..)) = channels.next() {
 					self.read_state.status = Some((
-						*channel,
+						channel,
 						match failure {
 							Failure::Ambiguous => {
 								"Read status could not be confirmed · unread markers may be out of date"
@@ -1038,7 +1295,9 @@ impl State {
 							_ => "Read status could not sync · unread markers may be out of date",
 						},
 					));
+					self.push_write_error(ActionKind::MarkRead, "", failure);
 				}
+				self.revision += 1;
 			}
 		}
 	}
@@ -1331,11 +1590,17 @@ mod navigation_tests {
 	#[test]
 	fn mark_all_read_keeps_ack_positions_when_a_pending_channel_is_forgotten() {
 		let mut state = with_unread_dms(3);
+		state.channels.rotate_right(1);
+		state.invalidate_navigation();
 		let Some(Command::MarkAllRead { request, channels }) = state.prepare_mark_all_read() else {
 			panic!("mark all read");
 		};
-		assert_eq!(channels.len(), 3);
-		state.read_state.forget(Id(1));
+		assert_eq!(
+			channels,
+			vec![(Id(3), Id(500)), (Id(1), Id(500)), (Id(2), Id(500))]
+		);
+		state.read_state.forget(Id(3));
+		assert_eq!(state.read_marker(Id(3)), Some(None));
 		state
 			.apply_read_state(Event::AllAck {
 				request,
@@ -1343,9 +1608,9 @@ mod navigation_tests {
 				result: Err(Failure::RateLimited),
 			})
 			.unwrap();
-		assert_eq!(state.unread(Id(2)), Some(false));
+		assert_eq!(state.unread(Id(1)), Some(false));
 		assert_eq!(
-			state.unread(Id(3)),
+			state.unread(Id(2)),
 			Some(true),
 			"the failed channel stays unread"
 		);
@@ -1425,7 +1690,7 @@ mod navigation_tests {
 					state.read_state.pending = Some(Pending::Guild {
 						guild: Id(42),
 						request,
-						channels: channels.into_iter().flatten().collect(),
+						channels,
 					});
 				}
 				if manual {
@@ -1448,6 +1713,11 @@ mod navigation_tests {
 						version: None,
 					})
 					.unwrap();
+				assert_eq!(
+					state.read_marker(Id(1)),
+					Some(Some(Id(if manual { 100 } else { 500 })))
+				);
+				assert_eq!(state.mention_count(Id(1)), u32::from(manual));
 				state
 					.apply_read_state(if guild {
 						Event::GuildAck {

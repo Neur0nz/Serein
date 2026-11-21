@@ -4926,3 +4926,15 @@ moderation-confirm-ban = Yasakla
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Bu eklentinin henüz gösterecek bir şeyi yok.
+
+# Optimistic write feedback
+action-write-failed = “{ $action }” işlemi başarısız oldu. { $reason }
+action-write-failed-for = { $target } için “{ $action }” işlemi başarısız oldu. { $reason }
+action-write-forward-note = İletme notunu gönder
+action-write-poll = Anket
+action-write-forbidden = İzin reddedildi.
+action-write-rate-limited = Yeniden denemeden önce biraz bekleyin.
+action-write-network = Bağlantı kurulamadı.
+action-write-ambiguous = Sonuç bilinmiyor. Yeniden denemeden önce Discord’u kontrol edin.
+action-write-busy = Çok fazla değişiklik beklemede. Biraz sonra yeniden deneyin.
+action-write-rejected = Discord değişikliği reddetti veya beklenmedik bir yanıt verdi.

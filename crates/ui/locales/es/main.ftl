@@ -4943,3 +4943,15 @@ moderation-confirm-ban = Banear
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Este complemento todavía no tiene nada que mostrar.
+
+# Optimistic write feedback
+action-write-failed = No se pudo completar «{ $action }». { $reason }
+action-write-failed-for = No se pudo completar «{ $action }» para { $target }. { $reason }
+action-write-forward-note = Enviar nota del reenvío
+action-write-poll = Encuesta
+action-write-forbidden = Permiso denegado.
+action-write-rate-limited = Espera un momento antes de volver a intentarlo.
+action-write-network = Falló la conexión.
+action-write-ambiguous = No se conoce el resultado. Comprueba Discord antes de volver a intentarlo.
+action-write-busy = Hay demasiados cambios pendientes. Vuelve a intentarlo en un momento.
+action-write-rejected = Discord rechazó el cambio o devolvió una respuesta inesperada.

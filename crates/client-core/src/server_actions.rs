@@ -1,12 +1,21 @@
-//! Deliberate server writes: one pending request and one bounded, session-only result.
+//! Bounded server writes: coalesced notification prefs, concurrent invites, and confirmed leave/delete.
+use crate::optimistic::ActionKind;
 use crate::{
 	Command, State,
 	auth::{AuthState, Failure},
+	optimistic::{Cancelled, CoalescedSlot, Finish, InFlightSet, SetOutcome, WriteKind},
 };
 use model::{Id, permissions::VIEW_CHANNEL};
-use std::time::{Duration, Instant};
+use std::{
+	collections::BTreeMap,
+	time::{Duration, Instant},
+};
 
 const CREATE_INSTANT_INVITE: u128 = 1;
+const MAX_NOTIFICATION_WRITES: usize = 32;
+const MAX_CONCURRENT_INVITES: usize = 8;
+const MAX_CONCURRENT_LEAVES: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InviteOptions {
 	pub max_age: u32,
@@ -50,6 +59,26 @@ impl NotificationOptions {
 				|| self.suppress_everyone.is_some()
 				|| self.suppress_roles.is_some())
 	}
+	pub(crate) fn merge(self, overlay: Self) -> Self {
+		Self {
+			level: overlay.level.or(self.level),
+			muted: overlay.muted.or(self.muted),
+			suppress_everyone: overlay.suppress_everyone.or(self.suppress_everyone),
+			suppress_roles: overlay.suppress_roles.or(self.suppress_roles),
+		}
+	}
+	pub(crate) fn sparse_diff(self, base: Self) -> Self {
+		Self {
+			level: (self.level != base.level).then_some(self.level).flatten(),
+			muted: (self.muted != base.muted).then_some(self.muted).flatten(),
+			suppress_everyone: (self.suppress_everyone != base.suppress_everyone)
+				.then_some(self.suppress_everyone)
+				.flatten(),
+			suppress_roles: (self.suppress_roles != base.suppress_roles)
+				.then_some(self.suppress_roles)
+				.flatten(),
+		}
+	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -88,21 +117,59 @@ pub enum Event {
 		result: Result<Option<String>, Failure>,
 	},
 }
+struct NotificationMeta {
+	observed: bool,
+	guild_label: String,
+}
+struct InviteInFlight {
+	nonce: String,
+	friend_label: String,
+}
+struct LeftServerSnapshot {
+	guild: model::Guild,
+	channels: Vec<model::Channel>,
+	perm_guild: Option<model::permissions::Guild>,
+	perm_channels: Vec<(Id, model::permissions::Channel)>,
+	observed: bool,
+	guild_label: String,
+}
 #[derive(Default)]
 pub struct Actions {
 	sequence: u64,
+	/// Synchronous/destructive server writes (`CreateInvite`, `Delete`).
 	pending: Option<(Action, u64, bool)>,
+	notifications: CoalescedSlot<Id, NotificationOptions, MAX_NOTIFICATION_WRITES>,
+	notification_meta: BTreeMap<Id, NotificationMeta>,
+	leaves: InFlightSet<Id, LeftServerSnapshot, MAX_CONCURRENT_LEAVES>,
 	status: Option<(Id, &'static str)>,
 	invite: Option<(Id, Id, String, Instant, InviteOptions)>,
-	sending: Option<(Id, Id, u64, String)>,
-	sent: std::collections::BTreeMap<Id, InviteStatus>,
+	sending: InFlightSet<(Id, Id), InviteInFlight, MAX_CONCURRENT_INVITES>,
+	sent: BTreeMap<Id, InviteStatus>,
 }
 impl Actions {
 	pub(crate) fn reset(&mut self) {
+		let mut notifications = std::mem::take(&mut self.notifications);
+		let _ = notifications.cancel_all();
+		let mut leaves = std::mem::take(&mut self.leaves);
+		let _ = leaves.cancel_all();
+		let mut sending = std::mem::take(&mut self.sending);
+		let _ = sending.cancel_all();
 		*self = Self {
 			sequence: self.sequence,
+			notifications,
+			leaves,
+			sending,
 			..Self::default()
 		};
+	}
+	pub(crate) fn optimistic_notifications(&self, guild: Id) -> Option<NotificationOptions> {
+		self.notifications.entry(&guild).map(|e| e.desired)
+	}
+	pub(crate) fn has_fast_pending(&self) -> bool {
+		self.pending.is_some()
+			|| !self.notifications.is_empty()
+			|| !self.leaves.is_empty()
+			|| !self.sending.is_empty()
 	}
 }
 impl State {
@@ -110,8 +177,6 @@ impl State {
 		guild.0 != 0
 			&& self.guild(guild).is_some()
 			&& (self.demo || (self.auth == AuthState::Authenticated && self.gateway_connected))
-			&& !self.server_action_pending()
-			&& !self.server_invite_pending()
 	}
 	pub fn update_server_notifications(
 		&mut self,
@@ -121,44 +186,113 @@ impl State {
 		if !options.valid() || !self.can_update_server_notifications(guild) {
 			return None;
 		}
-		self.request_server_action(Action::Notifications { guild, options })
+		let confirmed = self.confirmed_server_notification_settings(guild);
+		let desired = self.server_notification_settings(guild).merge(options);
+		let label = self.guild_toast_label(guild);
+		let outcome = self
+			.server_actions
+			.notifications
+			.set(guild, confirmed, desired);
+		self.server_actions.status = None;
+		match outcome {
+			SetOutcome::Full => {
+				self.server_actions.status = Some((guild, "Too many pending server updates"));
+				None
+			}
+			SetOutcome::Dispatch(seq) => {
+				self.server_actions.notification_meta.insert(
+					guild,
+					NotificationMeta {
+						observed: false,
+						guild_label: label,
+					},
+				);
+				self.revision = self.revision.wrapping_add(1);
+				Some(Command::ServerAction {
+					action: Action::Notifications {
+						guild,
+						options: desired.sparse_diff(confirmed),
+					},
+					request: seq,
+				})
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: Some(cancel_seq),
+			} => {
+				self.revision = self.revision.wrapping_add(1);
+				Some(Command::CancelPendingWrite {
+					kind: WriteKind::ServerAction,
+					request: cancel_seq,
+				})
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: None,
+			} => {
+				self.revision = self.revision.wrapping_add(1);
+				None
+			}
+		}
+	}
+	pub(crate) fn cancel_server_action_pre_wire(&mut self, request: u64) {
+		let Some((guild, outcome)) = self.server_actions.notifications.cancelled_by_seq(request)
+		else {
+			return;
+		};
+		match outcome {
+			Cancelled::Stale => {}
+			Cancelled::Settled => {
+				self.server_actions.notification_meta.remove(&guild);
+				self.revision = self.revision.wrapping_add(1);
+			}
+			Cancelled::DispatchFollowUp { seq, value } => {
+				if let Some(meta) = self.server_actions.notification_meta.get_mut(&guild) {
+					meta.observed = false;
+				}
+				let confirmed = self
+					.server_actions
+					.notifications
+					.entry(&guild)
+					.map(|e| e.confirmed)
+					.unwrap_or_default();
+				let sparse = value.sparse_diff(confirmed);
+				let options = if sparse.valid() { sparse } else { value };
+				self.push_follow_up(Command::ServerAction {
+					action: Action::Notifications { guild, options },
+					request: seq,
+				});
+			}
+		}
 	}
 	pub(crate) fn observe_server_notification_settings(
 		&mut self,
 		entries: &[crate::notifications::Setting],
 	) {
-		if let Some((Action::Notifications { guild, options }, _, observed)) =
-			&mut self.server_actions.pending
-		{
-			*observed |= entries
-				.iter()
-				.filter(|setting| setting.guild == Some(*guild))
-				.any(|setting| {
-					options
-						.level
-						.is_none_or(|value| setting.level == Some(value))
-						&& options.muted.is_none_or(|value| {
-							setting.muted == Some(value) && setting.mute_until.is_none()
-						}) && options
-						.suppress_everyone
-						.is_none_or(|value| setting.suppress_everyone == Some(value))
-						&& options
-							.suppress_roles
-							.is_none_or(|value| setting.suppress_roles == Some(value))
-				});
+		for setting in entries {
+			let Some(guild) = setting.guild else {
+				continue;
+			};
+			if let Some(meta) = self.server_actions.notification_meta.get_mut(&guild) {
+				meta.observed = true;
+			}
+			if self.server_actions.notifications.entry(&guild).is_some() {
+				let observed = NotificationOptions {
+					level: setting.level.filter(|level| *level <= 3),
+					muted: setting.muted(),
+					suppress_everyone: setting.suppress_everyone,
+					suppress_roles: setting.suppress_roles,
+				};
+				self.server_actions
+					.notifications
+					.observe_authoritative(&guild, observed);
+			}
 		}
 	}
 	pub fn server_invite_pending(&self) -> bool {
-		self.server_actions.sending.is_some()
+		!self.server_actions.sending.is_empty()
 	}
 	pub fn server_invite_status(&self, guild: Id, user: Id) -> Option<InviteStatus> {
-		if self
-			.server_actions
-			.sending
-			.as_ref()
-			.is_some_and(|(g, u, _, _)| *g == guild && *u == user)
-		{
-			return Some(InviteStatus::Sending);
+		if self.server_actions.sending.contains(&(guild, user)) {
+			return Some(InviteStatus::Sent);
 		}
 		self.server_actions
 			.invite
@@ -167,8 +301,9 @@ impl State {
 		self.server_actions.sent.get(&user).copied()
 	}
 	pub fn send_server_invite(&mut self, guild: Id, user: Id) -> Option<Command> {
-		if self.server_invite_pending()
-			|| self.server_action_pending()
+		if self.server_actions.sending.len() >= MAX_CONCURRENT_INVITES
+			|| self.server_actions.sending.contains(&(guild, user))
+			|| self.server_actions.pending.is_some()
 			|| (!self.demo && (self.auth != AuthState::Authenticated || !self.gateway_connected))
 			|| !self.friends().any(|friend| friend.id == user)
 			|| self.user_blocked(user) != Some(false)
@@ -181,16 +316,30 @@ impl State {
 		}
 		let url = self.created_invite(guild)?.to_owned();
 		let code = url.strip_prefix("https://discord.gg/")?.to_owned();
-		self.server_actions.sequence = self.server_actions.sequence.wrapping_add(1);
-		let request = self.server_actions.sequence;
 		self.send_sequence = self.send_sequence.wrapping_add(1);
 		let epoch = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap_or_default()
 			.as_millis();
 		let nonce = crate::fingerprint::nonce(epoch, self.send_sequence);
-		self.server_actions.sending = Some((guild, user, request, nonce.clone()));
+		let friend_label = self
+			.friends()
+			.find(|f| f.id == user)
+			.map(|f| f.name.clone())
+			.unwrap_or_else(|| "friend".into());
+		let request = self
+			.server_actions
+			.sending
+			.insert(
+				(guild, user),
+				InviteInFlight {
+					nonce: nonce.clone(),
+					friend_label,
+				},
+			)
+			.ok()?;
 		self.server_actions.status = None;
+		self.revision = self.revision.wrapping_add(1);
 		Some(Command::SendServerInvite {
 			guild,
 			user,
@@ -206,12 +355,9 @@ impl State {
 		request: u64,
 		result: Result<(model::Channel, model::Message), Failure>,
 	) -> Result<(), &'static str> {
-		let Some((g, u, r, nonce)) = self.server_actions.sending.as_ref() else {
+		let Some(in_flight) = self.server_actions.sending.finish(&(guild, user), request) else {
 			return Ok(());
 		};
-		if (*g, *u, *r) != (guild, user, request) {
-			return Ok(());
-		}
 		let result = result.and_then(|(channel, message)| {
 			if channel.guild.is_some()
 				|| channel.kind != 1
@@ -220,7 +366,7 @@ impl State {
 				|| channel.id.0 == 0
 				|| message.id.0 == 0
 				|| message.channel != channel.id
-				|| message.nonce.as_deref() != Some(nonce.as_str())
+				|| message.nonce.as_deref() != Some(in_flight.nonce.as_str())
 				|| self
 					.user
 					.as_ref()
@@ -236,7 +382,6 @@ impl State {
 				Ok((channel, message))
 			}
 		});
-		self.server_actions.sending = None;
 		match result {
 			Ok((channel, message)) => {
 				self.server_actions.sent.insert(user, InviteStatus::Sent);
@@ -258,11 +403,14 @@ impl State {
 					.sent
 					.insert(user, InviteStatus::Failed(failure));
 				self.server_actions.status = Some((guild, failure.label()));
-				if failure.ends_session() {
+				if failure.ends_session() && failure != Failure::Capacity {
 					self.fail(failure);
+				} else {
+					self.push_write_error(ActionKind::SendInvite, in_flight.friend_label, failure);
 				}
 			}
 		}
+		self.revision = self.revision.wrapping_add(1);
 		Ok(())
 	}
 	pub fn server_action_pending(&self) -> bool {
@@ -294,8 +442,8 @@ impl State {
 		if self
 			.server_actions
 			.sending
-			.as_ref()
-			.is_some_and(|s| s.0 == guild)
+			.iter()
+			.any(|((g, _), _)| *g == guild)
 		{
 			return;
 		}
@@ -387,7 +535,59 @@ impl State {
 			self.server_actions.status = Some((guild, reason));
 			return None;
 		}
-		self.request_server_action(Action::Leave(guild))
+		if self.server_actions.leaves.contains(&guild)
+			|| self
+				.server_actions
+				.pending
+				.as_ref()
+				.is_some_and(|(action, ..)| action.guild() == guild)
+		{
+			return None;
+		}
+		if !self.demo && (self.auth != AuthState::Authenticated || !self.gateway_connected) {
+			self.server_actions.status =
+				Some((guild, "Server actions unavailable while disconnected"));
+			return None;
+		}
+		let guild_record = self.guild(guild)?.clone();
+		let channels: Vec<model::Channel> = self
+			.channels
+			.iter()
+			.filter(|c| c.guild == Some(guild))
+			.cloned()
+			.collect();
+		let perm_guild = self.permissions.guilds.get(&guild).cloned();
+		let perm_channels: Vec<(Id, model::permissions::Channel)> = channels
+			.iter()
+			.filter_map(|c| {
+				self.permissions
+					.channels
+					.get(&c.id)
+					.map(|p| (c.id, p.clone()))
+			})
+			.collect();
+		let guild_label = self.guild_toast_label(guild);
+		let request = self
+			.server_actions
+			.leaves
+			.insert(
+				guild,
+				LeftServerSnapshot {
+					guild: guild_record,
+					channels,
+					perm_guild,
+					perm_channels,
+					observed: false,
+					guild_label,
+				},
+			)
+			.ok()?;
+		self.remove_server(guild);
+		self.revision = self.revision.wrapping_add(1);
+		Some(Command::ServerAction {
+			action: Action::Leave(guild),
+			request,
+		})
 	}
 	pub fn can_delete_server(&self, guild: Id) -> bool {
 		self.guild(guild).is_some()
@@ -443,11 +643,18 @@ impl State {
 		Some(Command::ServerAction { action, request })
 	}
 	pub(crate) fn cancel_server_action(&mut self) {
-		if let Some((guild, user, _, _)) = self.server_actions.sending.take() {
+		for ((guild, user), _) in self.server_actions.sending.cancel_all() {
 			self.server_actions
 				.sent
 				.insert(user, InviteStatus::Failed(Failure::Ambiguous));
 			self.server_actions.status = Some((guild, Failure::Ambiguous.label()));
+		}
+		let _ = self.server_actions.notifications.cancel_all();
+		self.server_actions.notification_meta.clear();
+		for (guild, snapshot) in self.server_actions.leaves.cancel_all() {
+			self.restore_left_server(snapshot);
+			self.server_actions.status =
+				Some((guild, "Outcome unknown; check Discord before retrying"));
 		}
 		if let Some((action, _, _)) = self.server_actions.pending.take() {
 			self.server_actions.status = Some((
@@ -455,13 +662,38 @@ impl State {
 				"Outcome unknown; check Discord before retrying",
 			));
 		}
+		self.revision = self.revision.wrapping_add(1);
 	}
 	pub(crate) fn observe_server_joined(&mut self, guild: Id) {
+		if let Some(snapshot) = self.server_actions.leaves.get_mut(&guild) {
+			snapshot.observed = true;
+		}
 		if let Some((Action::Leave(id), _, observed)) = &mut self.server_actions.pending
 			&& *id == guild
 		{
 			*observed = true;
 		}
+	}
+	fn restore_left_server(&mut self, snapshot: LeftServerSnapshot) {
+		if snapshot.observed || self.guild(snapshot.guild.id).is_some() {
+			return;
+		}
+		if self.guilds.len() < crate::MAX_NAV {
+			self.guilds.push(snapshot.guild);
+		}
+		for ch in snapshot.channels {
+			if self.channel(ch.id).is_none() && self.channels.len() < crate::MAX_NAV {
+				self.channels.push(ch);
+			}
+		}
+		if let Some(pg) = snapshot.perm_guild {
+			self.permissions.guilds.insert(pg.id, pg);
+		}
+		for (cid, pc) in snapshot.perm_channels {
+			self.permissions.channels.insert(cid, pc);
+		}
+		self.permissions.clear_cache();
+		self.invalidate_navigation();
 	}
 	pub(crate) fn apply_server_action(&mut self, event: Event) -> Result<(), &'static str> {
 		if let Event::InviteSent {
@@ -481,6 +713,104 @@ impl State {
 		else {
 			unreachable!()
 		};
+		if let Action::Notifications { guild, options } = action {
+			let valid_res = match result {
+				Ok(None) => Ok(()),
+				Ok(Some(_)) => Err(Failure::Ambiguous),
+				Err(failure) => Err(failure),
+			};
+			match self
+				.server_actions
+				.notifications
+				.finish(&guild, request, valid_res)
+			{
+				Finish::Stale => return Ok(()),
+				Finish::Settled { .. } => {
+					let meta = self.server_actions.notification_meta.remove(&guild);
+					let observed = meta.as_ref().is_some_and(|m| m.observed);
+					if !observed && self.guild(guild).is_some() {
+						self.confirm_server_notifications(guild, options)?;
+					}
+					self.server_actions.status = None;
+					self.revision = self.revision.wrapping_add(1);
+				}
+				Finish::DispatchFollowUp { seq, value } => {
+					let observed = self
+						.server_actions
+						.notification_meta
+						.get(&guild)
+						.is_some_and(|m| m.observed);
+					if let Some(meta) = self.server_actions.notification_meta.get_mut(&guild) {
+						meta.observed = false;
+					}
+					let confirmed = self
+						.server_actions
+						.notifications
+						.entry(&guild)
+						.map(|e| e.confirmed)
+						.unwrap_or_default();
+					if !observed && self.guild(guild).is_some() {
+						self.confirm_server_notifications(guild, options)?;
+					}
+					let sparse = value.sparse_diff(confirmed);
+					let options = if sparse.valid() { sparse } else { value };
+					self.push_follow_up(Command::ServerAction {
+						action: Action::Notifications { guild, options },
+						request: seq,
+					});
+				}
+				Finish::RolledBack { failure, .. } => {
+					let meta = self.server_actions.notification_meta.remove(&guild);
+					let label = meta
+						.map(|m| m.guild_label)
+						.unwrap_or_else(|| self.guild_toast_label(guild));
+					self.server_actions.status = Some((guild, failure.label()));
+					self.status = failure.label();
+					if failure.ends_session() && failure != Failure::Capacity {
+						self.fail(failure);
+					} else {
+						self.push_write_error(
+							ActionKind::UpdateServerNotifications,
+							label,
+							failure,
+						);
+					}
+					self.revision = self.revision.wrapping_add(1);
+				}
+			}
+			return Ok(());
+		}
+		if let Action::Leave(guild) = action {
+			let Some(snapshot) = self.server_actions.leaves.finish(&guild, request) else {
+				return Ok(());
+			};
+			let valid_res = match result {
+				Ok(None) => Ok(()),
+				Ok(Some(_)) => Err(Failure::Ambiguous),
+				Err(failure) => Err(failure),
+			};
+			match valid_res {
+				Ok(()) => {
+					if !snapshot.observed {
+						self.remove_server(guild);
+					}
+					self.server_actions.status = None;
+				}
+				Err(failure) => {
+					let label = snapshot.guild_label.clone();
+					self.restore_left_server(snapshot);
+					self.server_actions.status = Some((guild, failure.label()));
+					self.status = failure.label();
+					if failure.ends_session() && failure != Failure::Capacity {
+						self.fail(failure);
+					} else {
+						self.push_write_error(ActionKind::LeaveServer, label, failure);
+					}
+				}
+			}
+			self.revision = self.revision.wrapping_add(1);
+			return Ok(());
+		}
 		let Some((pending, sequence, observed)) = self.server_actions.pending else {
 			return Ok(());
 		};
@@ -496,29 +826,25 @@ impl State {
 			{
 				Ok(code)
 			}
-			Action::Leave(_) | Action::Delete(_) | Action::Notifications { .. }
-				if code.is_none() =>
-			{
-				Ok(None)
-			}
+			Action::Delete(_) if code.is_none() => Ok(None),
 			_ => Err(Failure::Ambiguous),
 		});
 		let status = match result {
 			Err(failure) => {
-				if failure.ends_session() {
+				if failure.ends_session() && failure != Failure::Capacity {
 					self.fail(failure);
+				} else {
+					let label = self.guild_toast_label(action.guild());
+					let action = match action {
+						Action::CreateInvite { .. } => ActionKind::SendInvite,
+						Action::Delete(_) => ActionKind::DeleteServer,
+						_ => ActionKind::UpdateServer,
+					};
+					self.push_write_error(action, label, failure);
 				}
 				failure.label()
 			}
 			Ok(code) => match action {
-				Action::Notifications { guild, options } => {
-					if observed || self.guild(guild).is_none() {
-						"Request completed; latest notification settings shown"
-					} else {
-						self.confirm_server_notifications(guild, options)?;
-						"Notification settings saved"
-					}
-				}
 				Action::CreateInvite {
 					guild,
 					channel,
@@ -538,18 +864,15 @@ impl State {
 						"Invite created, but channel access changed; check Discord"
 					}
 				}
-				Action::Leave(guild) | Action::Delete(guild) => {
+				Action::Delete(guild) => {
 					if observed {
 						"Request completed; latest server membership shown"
 					} else {
 						self.remove_server(guild);
-						if matches!(action, Action::Delete(_)) {
-							"Deleted server"
-						} else {
-							"Left server"
-						}
+						"Deleted server"
 					}
 				}
+				_ => "Saved",
 			},
 		};
 		self.server_actions.status = Some((action.guild(), status));
@@ -680,6 +1003,36 @@ mod tests {
 		});
 	}
 	#[test]
+	fn notification_level_acknowledgement_preserves_timed_server_mute() {
+		let mut state = state();
+		let guild = Id(2);
+		let expires = i64::MAX;
+		state
+			.apply_notification_preferences(crate::notifications::Event::Settings {
+				entries: vec![crate::notifications::Setting {
+					guild: Some(guild),
+					muted: Some(true),
+					mute_until: Some(expires),
+					..Default::default()
+				}],
+				replace: false,
+			})
+			.unwrap();
+		let command = state
+			.update_server_notifications(
+				guild,
+				NotificationOptions {
+					level: Some(1),
+					..Default::default()
+				},
+			)
+			.unwrap();
+		finish(&mut state, command, Ok(None));
+		let setting = state.notification_preferences.setting(Some(guild)).unwrap();
+		assert_eq!(setting.level, Some(1));
+		assert_eq!(setting.mute_until, Some(expires));
+	}
+	#[test]
 	fn notification_writes_need_membership_not_admin_and_confirm_after_unrelated_events() {
 		let mut state = state();
 		state.permissions.guilds.clear(); // An ordinary member need not manage the guild.
@@ -711,7 +1064,15 @@ mod tests {
 		let first = state.update_server_notifications(Id(2), edit).unwrap();
 		finish(&mut state, first, Ok(None));
 		assert_eq!(state.server_notification_settings(Id(2)).level, Some(1));
-		let old = state.update_server_notifications(Id(2), edit).unwrap();
+		let old = state
+			.update_server_notifications(
+				Id(2),
+				NotificationOptions {
+					level: Some(0),
+					..Default::default()
+				},
+			)
+			.unwrap();
 		state
 			.apply_notification_preferences(crate::notifications::Event::Settings {
 				entries: vec![crate::notifications::Setting {
@@ -724,22 +1085,12 @@ mod tests {
 			})
 			.unwrap();
 		finish(&mut state, old, Ok(None));
-		assert_eq!(state.server_notification_settings(Id(2)).level, Some(1));
+		// Authoritative Gateway update during the in-flight write must not be overwritten.
+		assert_eq!(state.server_notification_settings(Id(2)).level, Some(2));
 		assert_eq!(
 			state.server_notification_settings(Id(2)).suppress_roles,
 			Some(true)
 		);
-		state
-			.apply_notification_preferences(crate::notifications::Event::Settings {
-				entries: vec![crate::notifications::Setting {
-					guild: Some(Id(2)),
-					level: Some(2),
-					..Default::default()
-				}],
-				replace: false,
-			})
-			.unwrap();
-		assert_eq!(state.server_notification_settings(Id(2)).level, Some(2));
 		let old = state.update_server_notifications(Id(2), edit).unwrap();
 		state.cancel_server_action();
 		let newer = state
@@ -752,7 +1103,7 @@ mod tests {
 			)
 			.unwrap();
 		finish(&mut state, old, Ok(None));
-		assert!(state.server_action_pending());
+		assert!(state.server_actions.has_fast_pending());
 		finish(&mut state, newer, Ok(None));
 		assert_eq!(state.server_notification_settings(Id(2)).level, Some(0));
 		state.gateway_connected = false;
@@ -840,7 +1191,7 @@ mod tests {
 		};
 		assert_eq!(
 			state.server_invite_status(guild, user),
-			Some(InviteStatus::Sending)
+			Some(InviteStatus::Sent)
 		);
 		assert!(state.send_server_invite(guild, user).is_none());
 		assert!(state.create_server_invite(guild, Id(3)).is_none());
@@ -939,15 +1290,19 @@ mod tests {
 		state.permissions.guilds.get_mut(&Id(2)).unwrap().owner = Some(Id(9));
 		state.drafts.insert(Id(3), "Keep draft".into());
 		let leave = state.leave_server(Id(2)).unwrap();
+		assert!(state.guild(Id(2)).is_none());
 		finish(&mut state, leave, Err(Failure::Ambiguous));
 		assert!(state.guild(Id(2)).is_some());
 		let old = state.leave_server(Id(2)).unwrap();
+		assert!(state.guild(Id(2)).is_none());
 		state.cancel_server_action();
-		let new = state.leave_server(Id(2)).unwrap();
-		finish(&mut state, old, Ok(None));
-		assert!(state.server_action_pending());
 		assert!(state.guild(Id(2)).is_some());
+		let new = state.leave_server(Id(2)).unwrap();
+		assert!(state.guild(Id(2)).is_none());
+		finish(&mut state, old, Ok(None));
+		assert!(state.server_actions.has_fast_pending());
 		finish(&mut state, new, Ok(None));
+		assert!(!state.server_actions.has_fast_pending());
 		assert!(state.guild(Id(2)).is_none());
 		assert!(state.channel(Id(3)).is_none());
 		assert_eq!(state.selected, None);
@@ -956,7 +1311,20 @@ mod tests {
 	#[test]
 	fn server_actions_reject_stale_sessions_and_keep_rejoined_guilds() {
 		let mut state = state();
+		let rejoined = state.guild(Id(2)).unwrap().clone();
+		let rejoined_channel = state.channel(Id(3)).unwrap().clone();
+		let rejoined_perm_guild = state.permissions.guilds.get(&Id(2)).cloned();
+		let rejoined_perm_channel = state.permissions.channels.get(&Id(3)).cloned();
 		let leave = state.leave_server(Id(2)).unwrap();
+		assert!(state.guild(Id(2)).is_none());
+		state.guilds.push(rejoined);
+		state.channels.push(rejoined_channel);
+		if let Some(pg) = rejoined_perm_guild {
+			state.permissions.guilds.insert(Id(2), pg);
+		}
+		if let Some(pc) = rejoined_perm_channel {
+			state.permissions.channels.insert(Id(3), pc);
+		}
 		state.observe_server_joined(Id(2));
 		finish(&mut state, leave, Ok(None));
 		assert!(state.guild(Id(2)).is_some());

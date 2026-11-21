@@ -253,10 +253,8 @@ pub(super) fn contents(
 		.channels
 		.iter()
 		.find(|c| c.guild.is_none() && c.kind == 1 && c.recipients.iter().any(|u| u.id == user.id));
-	let enabled = !state.user_action_pending()
-		&& (state.demo
-			|| (state.gateway_connected
-				&& state.auth == client_core::auth::AuthState::Authenticated));
+	let enabled = state.demo
+		|| (state.gateway_connected && state.auth == client_core::auth::AuthState::Authenticated);
 	let reachable = user.id.0 != 0
 		&& state.user.as_ref().is_some_and(|own| own.id != user.id)
 		&& state.user_blocked(user.id) == Some(false);
@@ -771,12 +769,13 @@ mod tests {
 				}
 				apply_user_event(&mut state, UserEvent::Relationships(Some(vec![])));
 				assert!(prepare(Action::AddFriend(user.clone()), &mut state).is_some());
-				for label in ["Message", "Start a Call", "Add Friend"] {
-					assert_eq!(
-						click_menu_action(&state, &user, label, light, keyboard, true),
-						None
-					);
-				}
+				assert_eq!(
+					click_menu_action(&state, &user, "Add Friend", light, keyboard, true),
+					None
+				);
+				assert!(
+					click_menu_action(&state, &user, "Message", light, keyboard, true).is_some()
+				);
 			}
 		}
 	}
@@ -966,8 +965,8 @@ mod tests {
 			}
 			assert_eq!(writes, 1);
 			assert!(
-				state.channels.iter().any(|c| c.id == model::Id(22)),
-				"Wait for transport confirmation"
+				!state.channels.iter().any(|c| c.id == model::Id(22)),
+				"Close DM removes the channel optimistically"
 			);
 			assert!(render(&mut view, &mut state, vec![]).0.is_empty());
 		}

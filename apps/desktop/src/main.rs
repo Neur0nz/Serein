@@ -1362,19 +1362,6 @@ fn access_candidates(state: &State, event: &Event) -> Vec<model::Id> {
 		.map(|c| c.id)
 		.collect()
 }
-fn user_action_notice(event: &Event) -> Option<(ui::design::Level, &'static str)> {
-	let Event::UserAction(client_core::user_actions::Event::Written { action, result, .. }) = event
-	else {
-		return None;
-	};
-	Some(match result {
-		Ok(()) if matches!(action, client_core::user_actions::Action::OpenDm(_)) => {
-			(ui::design::Level::Error, action.completion_label())
-		}
-		Ok(()) => (ui::design::Level::Success, action.completion_label()),
-		Err(failure) => (ui::design::Level::Error, failure.label()),
-	})
-}
 fn queue_channel_preferences(
 	cache: Option<&cache::Cache>,
 	messaging: &mut ui::MessagingUi,
@@ -1494,7 +1481,9 @@ fn recovery_draft(state: &State, channel: model::Id) -> String {
 				.iter()
 				.rev()
 				.find(|pending| {
-					pending.channel == channel && pending.delivery != Delivery::Confirmed
+					pending.channel == channel
+						&& pending.delivery != Delivery::Confirmed
+						&& !pending.is_forwarded_message()
 				})
 				.map(|pending| pending.content.clone())
 		})
@@ -1545,6 +1534,11 @@ fn changes_active_history(state: &State, event: &Event) -> bool {
 		Event::Patch(patch) => &patch.channel,
 		Event::Edited { channel, .. }
 		| Event::Delete { channel, .. }
+		| Event::Deleted {
+			channel,
+			result: Ok(()),
+			..
+		}
 		| Event::DeleteBulk { channel, .. } => channel,
 		_ => return false,
 	};
@@ -1586,7 +1580,7 @@ fn demo_fetch(command: &Command) -> bool {
 		Command::ServerAdmin { action, .. } => !action.write(),
 		Command::ServerSettings { edit, .. } => edit.is_none(),
 		Command::Onboarding { action, .. } => matches!(action, onboarding::Action::Load { .. }),
-		Command::GuildFolders(change) => change.is_none(),
+		Command::GuildFolders { change, .. } => change.is_none(),
 		Command::MessagingPermissions { change, .. } => change.is_none(),
 		Command::EditProfile { changes, .. } => changes.is_none(),
 		Command::GifFavorites { change, .. } => change.is_none(),
@@ -3814,6 +3808,12 @@ impl Desktop {
 		};
 		let (channel, ids) = match event {
 			Event::Delete { channel, id } => (*channel, vec![*id]),
+			Event::Deleted {
+				channel,
+				message,
+				result: Ok(()),
+				..
+			} => (*channel, vec![*message]),
 			Event::DeleteBulk { channel, ids } if !ids.is_empty() && ids.len() <= 100 => {
 				(*channel, ids.clone())
 			}
@@ -3876,6 +3876,12 @@ impl Desktop {
 		}
 	}
 	/// Dispatches one queued command to the demo or live transport.
+	fn show_action_errors(&mut self) {
+		for error in self.state.take_action_errors() {
+			self.messaging.toasts.push_write_error(error);
+		}
+	}
+
 	fn command(&mut self, command: Command) {
 		// The offline preview has no one to tell.
 		if matches!(command, Command::Typing { .. }) && (self.state.demo || self.fixture_only) {
@@ -4193,9 +4199,10 @@ impl Desktop {
 					request,
 					action,
 				} => onboarding_demo::execute(guild, request, action),
-				Command::GuildFolders(settings) => Event::GuildFolders(Ok(settings
-					.map(|(_, settings)| settings)
-					.unwrap_or_default())),
+				Command::GuildFolders { request, change } => Event::GuildFolders {
+					request,
+					result: Ok(change.map(|(_, settings)| settings).unwrap_or_default()),
+				},
 				Command::SendServerInvite {
 					guild,
 					user,
@@ -4369,7 +4376,6 @@ impl Desktop {
 								});
 							}
 							reactions.retain(|r| r.count > 0);
-							self.state.reactions.reset();
 							let _ = self.state.timeline.set_reactions(message, Some(reactions));
 							// The fixture has no service readback; it updates synthetic RAM only.
 							E::Written {
@@ -4938,10 +4944,19 @@ impl Desktop {
 						result,
 					}
 				}
-				Command::Delete { channel, message } => Event::Delete {
+				Command::Delete {
 					channel,
-					id: message,
+					message,
+					request,
+				} => Event::Deleted {
+					channel,
+					message,
+					request,
+					result: Ok(()),
 				},
+				Command::CancelPendingWrite { kind, request } => {
+					Event::WriteCancelled { kind, request }
+				}
 				Command::Pin {
 					request,
 					channel,
@@ -5615,14 +5630,20 @@ impl Desktop {
 				}
 				continue;
 			}
-			let user_action_notice = user_action_notice(&event.event);
-			let user_action_was_pending =
-				user_action_notice.is_some() && self.state.user_action_pending();
 			self.delete_cached_messages(&event.event);
 			match &event.event {
 				Event::Delete { channel, id } => {
 					self.messaging
 						.messages_deleted(ctx, *channel, std::slice::from_ref(id));
+				}
+				Event::Deleted {
+					channel,
+					message,
+					result: Ok(()),
+					..
+				} => {
+					self.messaging
+						.messages_deleted(ctx, *channel, std::slice::from_ref(message));
 				}
 				Event::DeleteBulk { channel, ids } if ids.len() <= 100 => {
 					self.messaging.messages_deleted(ctx, *channel, ids);
@@ -5657,7 +5678,26 @@ impl Desktop {
 			) || matches!(&event.event, Event::RecipientRemoved { user, .. } if self.state.user.as_ref().is_some_and(|owner| owner.id == *user))
 				|| matches!(&event.event, Event::Reactions(client_core::reactions::Event::Read {channel,result:Err(Failure::Forbidden),..}) if self.state.selected==Some(*channel))
 				|| matches!(&event.event, Event::HistoryFailed { channel, request, failure: Failure::Forbidden }
-                if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending);
+                if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending)
+				|| matches!(
+					&event.event,
+					Event::ServerAction(client_core::server_actions::Event::Written {
+						action: client_core::server_actions::Action::Leave(_),
+						result: Ok(None),
+						..
+					}) | Event::GroupAction(client_core::group_actions::Event::Written {
+						result: Ok(None),
+						..
+					}) | Event::UserAction(client_core::user_actions::Event::Written {
+						action: client_core::user_actions::Action::CloseDm(_)
+							| client_core::user_actions::Action::MessageRequest {
+								accept: false,
+								..
+							},
+						result: Ok(()),
+						..
+					})
+				);
 			let history_changed = changes_active_history(&self.state, &event.event);
 			if history_changed {
 				match &event.event {
@@ -5741,12 +5781,6 @@ impl Desktop {
 					self.extensions.message_event(&self.state, event);
 				}
 			}
-			if user_action_was_pending
-				&& !self.state.user_action_pending()
-				&& let Some((level, text)) = user_action_notice
-			{
-				self.messaging.toasts.push(level, text);
-			}
 			// Only admitted service messages can establish a deleted reply target.
 			// Fence pending disk writes before the post-drain timeline snapshot is saved.
 			let deleted_replies = self.state.take_reply_deletions();
@@ -5768,6 +5802,10 @@ impl Desktop {
 			{
 				self.command(command);
 			}
+			for command in self.state.take_follow_up_commands() {
+				self.command(command);
+			}
+			self.show_action_errors();
 			// ponytail: accepted navigation removals clear account-wide history;
 			// add scoped disk deletion if channel churn makes refetch cost significant.
 			if invalidate || !removed_channels.is_empty() {
@@ -5857,12 +5895,17 @@ impl Desktop {
 			&& let Some(channel) = self.state.selected
 			&& self.state.can_read_history(channel)
 		{
+			let mut retained = Vec::new();
 			let messages = self
 				.state
-				.timeline
-				.iter()
-				.filter(|m| full_window || changed_messages.contains(&m.id))
-				.cloned()
+				.confirmed_history_messages()
+				.filter_map(|message| {
+					if !full_window {
+						retained.push(message.id);
+					}
+					(full_window || changed_messages.contains(&message.id))
+						.then(|| message.into_owned())
+				})
 				.collect();
 			let start = self.state.older_exhausted && !self.state.timeline.older_evicted();
 			let operation = if full_window {
@@ -5875,7 +5918,7 @@ impl Desktop {
 				cache::Operation::SaveChanges {
 					channel,
 					messages,
-					retained: self.state.timeline.iter().map(|m| m.id).collect(),
+					retained,
 					start,
 				}
 			};
@@ -6995,6 +7038,10 @@ impl eframe::App for Desktop {
 			self.messaging.accept_server_sticker(&ctx, scope, result);
 		}
 		self.messaging.voice_available = true;
+		self.show_action_errors();
+		for command in self.state.take_follow_up_commands() {
+			self.command(command);
+		}
 		if close_requested && !self.close_approved && !self.tray_window.system_close() {
 			self.sync_startup_selection(&ctx, true);
 		}
@@ -7012,6 +7059,7 @@ impl eframe::App for Desktop {
 				|| self.messaging.extensions.theme_editor_dirty()
 				|| self.state.server_settings.pending
 				|| self.state.server_admin.pending
+				|| self.state.has_fast_pending_writes()
 				|| self.uploads.has_unsent()
 				|| self.messaging.external_upload.has_unsent()
 				|| self.forgetting
@@ -7596,6 +7644,8 @@ impl eframe::App for Desktop {
 				ctx.request_repaint_after(due - now);
 			}
 			commands.extend(self.state.take_preload_retries());
+			commands.extend(self.state.take_follow_up_commands());
+			self.show_action_errors();
 			for command in commands {
 				self.command(command);
 			}
@@ -7770,6 +7820,9 @@ impl eframe::App for Desktop {
 				notes.push(
 					"Cached history cleanup is pending; closing now may leave deleted messages on disk.",
 				);
+			}
+			if self.state.has_fast_pending_writes() || self.cache_pending > 0 {
+				notes.push("Background changes are still finishing.");
 			}
 			if !self.fixture_only && self.app_settings.state.needs_attention() {
 				notes.push(self.app_settings.state.status());

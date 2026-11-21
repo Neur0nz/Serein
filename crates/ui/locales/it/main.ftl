@@ -4940,3 +4940,15 @@ moderation-confirm-ban = Banna
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Questo plugin non ha ancora nulla da mostrare.
+
+# Optimistic write feedback
+action-write-failed = Operazione «{ $action }» non riuscita. { $reason }
+action-write-failed-for = Operazione «{ $action }» non riuscita per { $target }. { $reason }
+action-write-forward-note = Invia la nota di inoltro
+action-write-poll = Sondaggio
+action-write-forbidden = Permesso negato.
+action-write-rate-limited = Attendi un momento prima di riprovare.
+action-write-network = Connessione non riuscita.
+action-write-ambiguous = L’esito è sconosciuto. Controlla Discord prima di riprovare.
+action-write-busy = Ci sono troppe modifiche in attesa. Riprova tra un momento.
+action-write-rejected = Discord ha rifiutato la modifica o restituito una risposta inattesa.

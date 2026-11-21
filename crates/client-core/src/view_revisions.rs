@@ -54,6 +54,8 @@ impl State {
 			Event::Message(_)
 				| Event::Patch(_)
 				| Event::Delete { .. }
+				| Event::Deleted { .. }
+				| Event::WriteCancelled { .. }
 				| Event::DeleteBulk { .. }
 				| Event::ReadState(_)
 				| Event::Reactions(_)

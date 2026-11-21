@@ -4923,3 +4923,15 @@ moderation-confirm-ban = BAN
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = このプラグインにはまだ表示するものがありません。
+
+# Optimistic write feedback
+action-write-failed = 「{ $action }」に失敗しました。{ $reason }
+action-write-failed-for = { $target }への「{ $action }」に失敗しました。{ $reason }
+action-write-forward-note = 転送メモを送信
+action-write-poll = 投票
+action-write-forbidden = 権限がありません。
+action-write-rate-limited = 少し待ってからもう一度お試しください。
+action-write-network = 接続に失敗しました。
+action-write-ambiguous = 結果を確認できませんでした。再試行する前にDiscordを確認してください。
+action-write-busy = 保留中の変更が多すぎます。少し待ってからお試しください。
+action-write-rejected = Discordが変更を拒否したか、予期しない応答を返しました。

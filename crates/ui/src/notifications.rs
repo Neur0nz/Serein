@@ -846,8 +846,18 @@ mod tests {
 			assert_eq!(cache.direct[0], Id(115));
 			assert_eq!(cache.direct[14], Id(101));
 			// Session failure through a local completion must also retire unread visibility.
-			state.folders_pending = true;
-			state.apply_guild_folders(Err(client_core::auth::Failure::Expired));
+			let Some(client_core::Command::GuildFolders { request, .. }) =
+				state.load_guild_folders()
+			else {
+				panic!("expected a folder load");
+			};
+			apply(
+				&mut state,
+				Event::GuildFolders {
+					request,
+					result: Err(client_core::auth::Failure::Expired),
+				},
+			);
 			assert!(cache.sync(&state));
 			assert!(cache.direct.is_empty());
 			apply(&mut state, Event::Resumed);

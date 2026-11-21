@@ -33,6 +33,7 @@ impl DiscordApi {
 
 	/// Explicit account preference update; never automatically called for a local preview.
 	pub async fn set_activity_sharing(&self, enabled: bool) -> Result<bool, Failure> {
+		let _settings = self.account_settings_write().await?;
 		let current = self.read_activity_sharing().await?;
 		if current.enabled == enabled {
 			return Ok(enabled);
@@ -82,6 +83,7 @@ impl DiscordApi {
 	pub async fn set_idle_timeout(&self, secs: u32) -> Result<(), Failure> {
 		const UNCONFIRMED: Failure =
 			Failure::ProtocolAt("Discord idle timeout was not confirmed; refresh before retrying");
+		let _settings = self.account_settings_write().await?;
 		let current = self.read_activity_sharing().await?;
 		if current.afk_timeout == Some(secs) {
 			return Ok(());
@@ -107,6 +109,7 @@ impl DiscordApi {
 		if !presence.valid() {
 			return Err(Failure::Protocol);
 		}
+		let _settings = self.account_settings_write().await?;
 		let current = self.read_activity_sharing().await?;
 		let existing =
 			activity_sharing::account_presence(&current).map_err(|_| Failure::Protocol)?;

@@ -132,17 +132,16 @@ impl MessagingUi {
 			);
 			ui.add_space(16.0);
 			design::label(ui, &language.text("friends-username"));
-			let busy = state.user_action_pending();
-			let enabled = !busy
-				&& !self.friends.username.trim().is_empty()
+			if self.friends.username.trim().is_empty()
+				&& let Some(failed) = state.take_failed_add_friend()
+			{
+				self.friends.username = failed;
+			}
+			let enabled = !self.friends.username.trim().is_empty()
 				&& (state.demo
 					|| (state.gateway_connected
 						&& state.auth == client_core::auth::AuthState::Authenticated));
-			let label = if busy {
-				language.text("friends-sending")
-			} else {
-				language.text("friends-send-request")
-			};
+			let label = language.text("friends-send-request");
 			let mut send = false;
 			let mut field = |ui: &mut egui::Ui, width: f32| {
 				ui.allocate_ui(vec2(width, 40.0), |ui| {
@@ -180,6 +179,7 @@ impl MessagingUi {
 				send |= action(ui);
 			}
 			if send && let Some(command) = state.add_friend(&self.friends.username) {
+				self.friends.username.clear();
 				commands.push(command);
 			}
 			if state.demo {
@@ -225,12 +225,15 @@ impl MessagingUi {
 		egui::Frame::new()
 			.inner_margin(egui::Margin::symmetric(24, 16))
 			.show(ui, |ui| {
-				let [incoming, outgoing] = [false, true].map(|outgoing| {
-					state
-						.pending_friends()
-						.filter(|(_, _, incoming)| *incoming != outgoing)
-						.count()
-				});
+				let optimistic_outgoing = state.optimistic_outgoing_requests();
+				let incoming = state
+					.pending_friends()
+					.filter(|(_, _, incoming)| *incoming)
+					.count();
+				let outgoing = state
+					.pending_friends()
+					.filter(|(_, _, incoming)| !*incoming)
+					.count() + optimistic_outgoing.len();
 				let labels = [
 					format!("{} — {incoming}", language.text("friends-incoming")),
 					format!("{} — {outgoing}", language.text("friends-outgoing")),
@@ -260,7 +263,15 @@ impl MessagingUi {
 					})
 					.collect();
 				rows.sort_unstable_by(|a, b| a.0.name.cmp(&b.0.name).then(a.0.id.cmp(&b.0.id)));
-				if rows.is_empty() {
+				let pending_names: Vec<String> = if self.friends.outgoing {
+					optimistic_outgoing
+						.into_iter()
+						.filter(|name| name.to_lowercase().contains(&query))
+						.collect()
+				} else {
+					Vec::new()
+				};
+				if rows.is_empty() && pending_names.is_empty() {
 					let title = if !state.friend_requests_known() {
 						language.text("friends-requests-unavailable")
 					} else if !query.is_empty() {
@@ -289,15 +300,39 @@ impl MessagingUi {
 							} else {
 								language.text("friends-incoming")
 							},
-							rows.len()
+							rows.len() + pending_names.len()
 						),
 						colors.muted,
 					),
 				);
 				ui.add_space(8.0);
 				ui.spacing_mut().item_spacing.y = 0.0;
-				let enabled =
-					!state.user_action_pending() && (state.demo || state.gateway_connected);
+				for username in &pending_names {
+					ui.push_id(("optimistic-outgoing", username), |ui| {
+						let (rect, _, _) = person_row(ui, false, egui::Sense::hover());
+						let layout = RowLayout::new(rect, 0);
+						ui.painter()
+							.circle_filled(layout.avatar.center(), 20.0, colors.raised);
+						let mut text = ui.new_child(egui::UiBuilder::new().max_rect(layout.text));
+						text.spacing_mut().item_spacing.y = 1.0;
+						text.add(
+							egui::Label::new(
+								design::semibold(ui, format!("@{username}"), 15.0)
+									.color(colors.text_strong),
+							)
+							.truncate(),
+						);
+						text.add(
+							egui::Label::new(
+								RichText::new(language.text("friends-outgoing-request"))
+									.size(13.0)
+									.color(colors.muted),
+							)
+							.truncate(),
+						);
+					});
+				}
+				let enabled = state.demo || state.gateway_connected;
 				let mut after_hot = false;
 				self.scroll
 					.attach(
@@ -627,10 +662,9 @@ impl MessagingUi {
 									.flatten();
 								let can_message = restricted.is_none()
 									&& (dm.is_some()
-										|| (!state.user_action_pending()
-											&& (state.demo
-												|| (state.gateway_connected
-													&& state.auth == client_core::auth::AuthState::Authenticated))));
+										|| state.demo || (state.gateway_connected
+										&& state.auth
+											== client_core::auth::AuthState::Authenticated));
 								let (rect, response, hot) =
 									person_row(ui, after_hot, egui::Sense::click());
 								after_hot = hot;
