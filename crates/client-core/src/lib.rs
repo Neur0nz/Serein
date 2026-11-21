@@ -24,6 +24,7 @@ pub mod member_search;
 pub mod message_actions;
 pub mod messaging_permissions;
 pub mod notifications;
+pub mod optimistic;
 pub mod polls;
 pub mod preload;
 pub mod presence;
