@@ -1094,6 +1094,7 @@ struct Desktop {
 	/// messages the timeline never loaded.
 	audio_in_timeline: bool,
 	video: video::Video,
+	video_converter: Option<std::sync::Arc<gpu_video::Converter>>,
 	/// Synthetic stream/camera textures the demo view borrows by id.
 	_demo_textures: Vec<egui::TextureHandle>,
 	/// Offline fixture flags start (and optionally pause) the demo attachment without input.
@@ -2082,8 +2083,8 @@ impl Desktop {
 		// detail in a graphics bug report.
 		if let Some(render_state) = cc.wgpu_render_state.as_ref() {
 			messaging.gpu_adapter = gpu::describe(&render_state.adapter.get_info());
-			gpu_video::install(render_state);
 		}
+		let video_converter = cc.wgpu_render_state.as_ref().map(gpu_video::Converter::new);
 		let startup = startup::Startup::new(&cc.egui_ctx, &runtime, &mut messaging, demo);
 		// A G-SYNC display follows this window's uneven presents and can flicker (#889), so the
 		// interface offers the steady refresh rate once. An answered offer never loads the driver
@@ -2697,7 +2698,7 @@ impl Desktop {
 			downloads: downloads::Downloads::default(),
 			audio: audio::Audio::default(),
 			audio_in_timeline: false,
-			video: video::Video::default(),
+			video: video::Video::new(video_converter.clone()),
 			_demo_textures: demo_textures,
 			demo_video_autoplay: if std::env::args().any(|arg| arg == "--demo-video-paused") {
 				Some(true)
@@ -2745,7 +2746,8 @@ impl Desktop {
 			avatar_cleanup: None,
 			avatar_start_failed: false,
 			avatar_clear_account: None,
-			voice: voice::Voice::default(),
+			voice: voice::Voice::new(video_converter.clone()),
+			video_converter,
 			runtime,
 			store,
 			cache,
@@ -5174,11 +5176,14 @@ impl Desktop {
 			}
 		}
 	}
-	fn poll_voice(&mut self, ctx: &egui::Context) {
-		if let Some(command) =
-			self.voice
-				.poll(&self.runtime, &mut self.state, &mut self.messaging, ctx)
-		{
+	fn poll_voice(&mut self, ctx: &egui::Context, video_visible: bool) {
+		if let Some(command) = self.voice.poll(
+			&self.runtime,
+			&mut self.state,
+			&mut self.messaging,
+			ctx,
+			video_visible,
+		) {
 			self.command(command);
 		}
 		// A heartbeat probe replaces a dead gateway socket in seconds, before the rejoin uses it.
@@ -6364,7 +6369,9 @@ impl eframe::App for Desktop {
 	/// One UI frame: pumps workers, expires challenges, renders and drains commands.
 	fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
 		// Last frame's shapes are painted; video textures retired since then can go.
-		gpu_video::collect();
+		if let Some(converter) = &self.video_converter {
+			converter.collect();
+		}
 		// `raw_input_hook` samples placements before the pass begins, where a requested repaint
 		// can be dropped when the pass starts, so the frame that saves a resting one is asked here.
 		// Every pass asks: a discarded pass's request would arrive stale and be ignored.
@@ -6753,7 +6760,7 @@ impl eframe::App for Desktop {
 		self.messaging.voice_ptm_active = self.state.voice.active.is_some()
 			&& (self.messaging.push_to_mute_down(ctx) || self.hotkeys.push_to_mute_down());
 		if self.state.auth == AuthState::Authenticated || self.state.demo {
-			self.poll_voice(ctx);
+			self.poll_voice(ctx, !hidden_or_closing && !minimized);
 		} else {
 			self.voice.stop();
 		}

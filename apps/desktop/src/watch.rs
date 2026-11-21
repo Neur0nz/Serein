@@ -6,6 +6,7 @@ use eframe::egui;
 use model::Id;
 use std::{
 	sync::{Arc, Mutex},
+	task::Poll,
 	time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -16,17 +17,54 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_secs(30);
 const DECODED_BUDGET: usize = 128 * 1024 * 1024;
 
 /// Latest stream picture and whether the UI still has to upload it.
-type Slot = Option<(platform::video::Picture, bool)>;
+struct Latest {
+	picture: platform::video::Picture,
+	fresh: bool,
+	presentation: Option<discord_voice::Presentation>,
+}
+
+impl Latest {
+	fn present(
+		&mut self,
+		now: Instant,
+		ctx: &egui::Context,
+		upload: impl FnOnce(
+			&platform::video::Picture,
+		) -> Poll<Result<Option<egui::load::SizedTexture>, &'static str>>,
+	) -> Result<Option<egui::load::SizedTexture>, &'static str> {
+		if !self.fresh {
+			return Ok(None);
+		}
+		if let Some(stamp) = &self.presentation {
+			let deadline = stamp.deadline(now);
+			if !stamp.is_current() {
+				self.fresh = false;
+				return Ok(None);
+			}
+			if deadline > now {
+				ctx.request_repaint_after(deadline - now);
+				return Ok(None);
+			}
+		}
+		match upload(&self.picture) {
+			Poll::Pending => Ok(None),
+			Poll::Ready(result) => {
+				self.fresh = false;
+				result
+			}
+		}
+	}
+}
 
 /// Replace the latest picture in place: a plain copy of the decoder's planes into one reused
 /// allocation. Colour conversion happens on the GPU when the UI uploads it.
-fn store_frame(slot: &mut Slot, frame: discord_voice::RemoteFrame<'_>) -> bool {
+fn store_frame(slot: &mut Option<Latest>, frame: discord_voice::RemoteFrame<'_>) -> bool {
 	let picture = frame.picture;
 	if !picture.is_valid() {
 		return false;
 	}
 	let len = picture.data.len();
-	let mut data = slot.take().map(|(old, _)| old.data).unwrap_or_default();
+	let mut data = slot.take().map(|old| old.picture.data).unwrap_or_default();
 	if data.capacity() > 1024 * 1024 && data.capacity() > len.saturating_mul(4) {
 		// Release a previous large resolution while keeping ordinary resize reuse.
 		data = Vec::new();
@@ -35,7 +73,11 @@ fn store_frame(slot: &mut Slot, frame: discord_voice::RemoteFrame<'_>) -> bool {
 	// Exact growth: never double a previous resolution's allocation beyond the frame.
 	data.reserve_exact(len);
 	data.extend_from_slice(picture.data);
-	*slot = Some((picture.with_data(data), true));
+	*slot = Some(Latest {
+		picture: picture.with_data(data),
+		fresh: true,
+		presentation: None,
+	});
 	true
 }
 
@@ -43,7 +85,7 @@ fn store_frame(slot: &mut Slot, frame: discord_voice::RemoteFrame<'_>) -> bool {
 // skipped here: the H.264 decoder has already consumed their reference state.
 #[derive(Default)]
 struct Scheduled {
-	latest: Slot,
+	latest: Option<Latest>,
 	pending: std::collections::VecDeque<(platform::video::Picture, discord_voice::Presentation)>,
 	bytes: usize,
 }
@@ -59,12 +101,12 @@ impl Scheduled {
 		if length > DECODED_BUDGET {
 			return false;
 		}
-		let old = if self.latest.as_ref().is_some_and(|(_, fresh)| !*fresh) {
+		let old = if self.latest.as_ref().is_some_and(|latest| !latest.fresh) {
 			self.latest.take()
 		} else {
 			None
 		};
-		let mut data = old.map(|(picture, _)| picture.data).unwrap_or_default();
+		let mut data = old.map(|latest| latest.picture.data).unwrap_or_default();
 		if data.capacity() > length.saturating_mul(4) {
 			data = Vec::new();
 		}
@@ -74,7 +116,7 @@ impl Scheduled {
 				+ required + self
 				.latest
 				.as_ref()
-				.map_or(0, |(picture, _)| picture.data.capacity())
+				.map_or(0, |latest| latest.picture.data.capacity())
 				> DECODED_BUDGET
 		{
 			let Some((old, _)) = self.pending.pop_front() else {
@@ -92,13 +134,18 @@ impl Scheduled {
 	}
 	fn advance(&mut self, now: Instant) -> Option<Instant> {
 		while let Some((_, stamp)) = self.pending.front() {
-			if stamp.is_current() && stamp.deadline(now) > now {
-				return Some(stamp.deadline(now));
+			let deadline = stamp.deadline(now);
+			if stamp.is_current() && deadline > now {
+				return Some(deadline);
 			}
 			let (picture, stamp) = self.pending.pop_front().expect("front exists");
 			self.bytes -= picture.data.capacity();
 			if stamp.is_current() {
-				self.latest = Some((picture, true));
+				self.latest = Some(Latest {
+					picture,
+					fresh: true,
+					presentation: Some(stamp),
+				});
 			}
 		}
 		None
@@ -136,7 +183,6 @@ struct Live {
 	frames: Arc<Mutex<Scheduled>>,
 }
 
-#[derive(Default)]
 pub(super) struct Watch {
 	pending: Option<Pending>,
 	live: Option<Live>,
@@ -144,10 +190,28 @@ pub(super) struct Watch {
 	ended: Option<(ui::design::Level, &'static str)>,
 	sequence: u64,
 	status: &'static str,
+	video_error: Option<&'static str>,
 	/// GPU texture behind `ui.voice_stream_view`.
 	texture: crate::gpu_video::VideoTexture,
 }
+impl Default for Watch {
+	fn default() -> Self {
+		Self::new(None)
+	}
+}
 impl Watch {
+	pub fn new(converter: Option<Arc<crate::gpu_video::Converter>>) -> Self {
+		Self {
+			pending: None,
+			live: None,
+			ended: None,
+			sequence: 0,
+			status: "",
+			video_error: None,
+			texture: crate::gpu_video::VideoTexture::new(converter),
+		}
+	}
+
 	pub fn stop(&mut self) {
 		self.pending = None;
 		self.ended = None;
@@ -155,7 +219,8 @@ impl Watch {
 			live.task.abort();
 		}
 		// Logout stops polling, so release the GPU picture here; disposal waits a frame.
-		self.texture = Default::default();
+		self.texture.clear();
+		self.video_error = None;
 	}
 	fn context(&self) -> Option<Context> {
 		self.pending
@@ -229,7 +294,7 @@ impl Watch {
 		runtime: &Runtime,
 		state: &mut State,
 		ui: &mut ui::MessagingUi,
-		ctx: &egui::Context,
+		(ctx, video_visible): (&egui::Context, bool),
 		call: Option<super::screen::Call<'_>>,
 		audio: Option<std::sync::mpsc::SyncSender<discord_voice::PlaybackFrame>>,
 	) -> Option<Command> {
@@ -272,7 +337,6 @@ impl Watch {
 			ui.toasts.push(level, message);
 			state.stop_watching();
 			ui.voice_stream_view = None;
-			self.texture = Default::default();
 			ui.voice_stream_status = self.status;
 			return command.or_else(|| {
 				let context = context.filter(|context| context.generation == state.generation)?;
@@ -362,24 +426,50 @@ impl Watch {
 			}
 			// Uploading copies the planes into GPU staging, so it runs under the slot lock
 			// and the decoder keeps refilling the same allocation.
-			if let Ok(mut slot) = live.frames.try_lock() {
-				if let Some(deadline) = slot.advance(Instant::now()) {
-					ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+			let slots = video_visible.then(|| live.frames.try_lock());
+			if let Some(Ok(mut slot)) = slots {
+				let now = Instant::now();
+				if let Some(deadline) = slot.advance(now) {
+					if let Some((picture, stamp)) = slot.pending.front()
+						&& stamp.is_current()
+					{
+						let _ = self.texture.prepare(ctx, &picture.borrow());
+					}
+					ctx.request_repaint_after(deadline.saturating_duration_since(now));
 				}
-				if let Some((picture, fresh)) = slot.latest.as_mut()
-					&& std::mem::take(fresh)
-					&& let Some(texture) =
-						self.texture.upload(ctx, "remote-stream", picture.borrow())
-				{
-					ui.voice_stream_view = Some(texture);
-					self.status = "Watching the stream";
+				if let Some(latest) = slot.latest.as_mut() {
+					match latest.present(now, ctx, |picture| {
+						let picture = picture.borrow();
+						self.texture
+							.prepare(ctx, &picture)
+							.map_ok(|()| self.texture.upload(ctx, "remote-stream", picture))
+					}) {
+						Ok(Some(texture)) => {
+							ui.voice_stream_view = Some(texture);
+							self.status = "Watching the stream";
+							self.video_error = None;
+						}
+						Ok(None) => {}
+						// The render failure leaves the stream transport and audio running.
+						Err(error) => {
+							ui.voice_stream_view = None;
+							self.texture.clear();
+							self.video_error = Some(error);
+						}
+					}
 				}
+			} else if matches!(slots, Some(Err(std::sync::TryLockError::WouldBlock))) {
+				ctx.request_repaint();
 			}
 		} else {
 			ui.voice_stream_view = None;
-			self.texture = Default::default();
+			self.texture.clear();
 		}
-		ui.voice_stream_status = if wanted.is_some() { self.status } else { "" };
+		ui.voice_stream_status = if wanted.is_some() {
+			self.video_error.unwrap_or(self.status)
+		} else {
+			""
+		};
 		command
 	}
 	fn start(
@@ -487,19 +577,13 @@ mod tests {
 		for failed in [false, true] {
 			state.voice.active.as_mut().unwrap().watching = Some(context.streamer);
 			let (_send, events) = watch::channel(None);
-			let mut watch = Watch {
-				pending: None,
-				live: Some(Live {
-					context,
-					task: runtime.spawn(std::future::pending()),
-					events,
-					frames: Arc::new(Mutex::new(Scheduled::default())),
-				}),
-				ended: None,
-				sequence: 0,
-				status: "",
-				texture: Default::default(),
-			};
+			let mut watch = Watch::new(None);
+			watch.live = Some(Live {
+				context,
+				task: runtime.spawn(std::future::pending()),
+				events,
+				frames: Arc::new(Mutex::new(Scheduled::default())),
+			});
 			for phase in [
 				voice::Phase::Connected,
 				voice::Phase::Securing,
@@ -511,7 +595,7 @@ mod tests {
 				state.voice.active.as_mut().unwrap().phase = phase;
 				assert!(
 					watch
-						.poll(&runtime, &mut state, &mut ui, &ctx, None, None)
+						.poll(&runtime, &mut state, &mut ui, (&ctx, true), None, None)
 						.is_none()
 				);
 				assert!(watch.live.is_some());
@@ -522,7 +606,7 @@ mod tests {
 				state.stop_watching();
 			}
 			assert!(matches!(
-				watch.poll(&runtime, &mut state, &mut ui, &ctx, None, None),
+				watch.poll(&runtime, &mut state, &mut ui, (&ctx, true), None, None),
 				Some(Command::Voice(voice::Command::StopWatching {
 					channel, request, stream_request: 2,
 				})) if channel == context.channel && request == context.request
@@ -554,18 +638,18 @@ mod tests {
 	fn watch_reuses_the_frame_buffer_and_flags_only_updates() {
 		let mut slot = None;
 		assert!(store_frame(&mut slot, frame(2, 2, &i420(2, 2, 1))));
-		let planes = slot.as_ref().unwrap().0.data.as_ptr();
+		let planes = slot.as_ref().unwrap().picture.data.as_ptr();
 		for value in 0..20 {
-			slot.as_mut().unwrap().1 = false;
+			slot.as_mut().unwrap().fresh = false;
 			assert!(store_frame(&mut slot, frame(2, 2, &i420(2, 2, value))));
-			let (picture, fresh) = slot.as_ref().unwrap();
-			assert!(*fresh);
-			assert_eq!(picture.data.as_ptr(), planes);
-			assert_eq!(picture.data, i420(2, 2, value));
+			let latest = slot.as_ref().unwrap();
+			assert!(latest.fresh);
+			assert_eq!(latest.picture.data.as_ptr(), planes);
+			assert_eq!(latest.picture.data, i420(2, 2, value));
 		}
 		// A smaller picture reuses the allocation too.
 		assert!(store_frame(&mut slot, frame(1, 1, &i420(1, 1, 9))));
-		let (picture, _) = slot.as_ref().unwrap();
+		let picture = &slot.as_ref().unwrap().picture;
 		assert_eq!(picture.data.as_ptr(), planes);
 		assert_eq!((picture.width, picture.height), (1, 1));
 	}
@@ -574,7 +658,7 @@ mod tests {
 	fn watch_invalid_frames_preserve_the_last_valid_picture() {
 		let mut slot = None;
 		assert!(store_frame(&mut slot, frame(1, 1, &i420(1, 1, 4))));
-		let planes = slot.as_ref().unwrap().0.data.as_ptr();
+		let planes = slot.as_ref().unwrap().picture.data.as_ptr();
 		for invalid in [
 			frame(0, 1, &[]),
 			frame(1, 0, &[]),
@@ -582,7 +666,7 @@ mod tests {
 			frame(u32::MAX, u32::MAX, &[]),
 		] {
 			assert!(!store_frame(&mut slot, invalid));
-			let (picture, _) = slot.as_ref().unwrap();
+			let picture = &slot.as_ref().unwrap().picture;
 			assert_eq!(picture.data.as_ptr(), planes);
 			assert_eq!((picture.width, picture.height), (1, 1));
 		}
@@ -596,7 +680,7 @@ mod tests {
 			frame(1920, 1080, &i420(1920, 1080, 0))
 		));
 		assert!(store_frame(&mut slot, frame(16, 16, &i420(16, 16, 0))));
-		let (picture, _) = slot.take().unwrap();
+		let picture = slot.take().unwrap().picture;
 		assert_eq!(picture.data.len(), 16 * 16 * 3 / 2);
 		assert!(picture.data.capacity() <= 16 * 16 * 6);
 	}
@@ -612,7 +696,7 @@ mod tests {
 			&mut slot,
 			frame(1920, 1080, &i420(1920, 1080, 0))
 		));
-		let (picture, _) = slot.take().unwrap();
+		let picture = slot.take().unwrap().picture;
 		assert_eq!(picture.data.len(), 1920 * 1080 * 3 / 2);
 		assert!(picture.data.capacity() <= 1920 * 1080 * 3 / 2);
 	}
@@ -634,8 +718,9 @@ mod tests {
 		assert_eq!(queue.advance(now), Some(now + Duration::from_millis(228)));
 		queue.advance(now + Duration::from_millis(260));
 		assert_eq!(queue.pending.len(), 5);
-		assert!(queue.latest.as_ref().unwrap().1);
-		assert!(queue.bytes + queue.latest.as_ref().unwrap().0.data.capacity() <= DECODED_BUDGET);
+		let latest = queue.latest.as_ref().unwrap();
+		assert!(latest.fresh);
+		assert!(queue.bytes + latest.picture.data.capacity() <= DECODED_BUDGET);
 		drop(queue);
 		// A backend's RGBA fallback reaches the byte bound before the eight-picture bound.
 		let mut queue = Scheduled::default();
@@ -653,6 +738,43 @@ mod tests {
 		queue.advance(now + Duration::from_secs(1));
 		assert!(queue.pending.is_empty());
 		assert_eq!(queue.bytes, 0);
-		assert!(queue.latest.as_ref().unwrap().1);
+		assert!(queue.latest.as_ref().unwrap().fresh);
+	}
+
+	#[test]
+	fn watch_presents_a_retained_picture_once_when_conversion_is_ready() {
+		let now = Instant::now();
+		let due = now + Duration::from_millis(100);
+		let ctx = egui::Context::default();
+		let mut queue = Scheduled::default();
+		let pixels = i420(2, 2, 9);
+		let mut incoming = frame(2, 2, &pixels);
+		incoming.presentation = Some(discord_voice::Presentation::new(due));
+		assert!(queue.store(incoming));
+		assert_eq!(queue.advance(now), Some(due));
+		assert!(queue.latest.is_none());
+		queue.advance(due);
+		let latest = queue.latest.as_mut().unwrap();
+		assert_eq!(latest.presentation.as_ref().unwrap().deadline(due), due);
+		assert!(
+			latest
+				.present(due, &ctx, |_| Poll::Pending)
+				.unwrap()
+				.is_none()
+		);
+		let ready = due + Duration::from_secs(1);
+		let expected =
+			egui::load::SizedTexture::new(egui::TextureId::Managed(9), egui::vec2(2., 2.));
+		let shown = latest.present(ready, &ctx, |picture| {
+			assert_eq!(picture.data, pixels);
+			Poll::Ready(Ok(Some(expected)))
+		});
+		assert_eq!(shown.unwrap().unwrap().id, expected.id);
+		assert!(
+			latest
+				.present(ready, &ctx, |_| panic!("picture already uploaded"))
+				.unwrap()
+				.is_none()
+		);
 	}
 }
