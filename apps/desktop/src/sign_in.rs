@@ -591,13 +591,17 @@ impl Desktop {
 					// The scroll bar belongs on the window's edge, not the form's.
 					.auto_shrink(false)
 					.show(ui, |ui| {
-						let form = if self.sign_in_height > 0.0 {
-							self.sign_in_height
-						} else {
+						let first_layout = self.sign_in_height == 0.0;
+						let form = if first_layout {
 							480.0
+						} else {
+							self.sign_in_height
 						};
 						// A little above the middle, where the eye lands first.
-						ui.add_space(((ui.available_height() - form) * 0.42).max(16.0));
+						let available_height = ui.available_height();
+						let top =
+							|form_height: f32| ((available_height - form_height) * 0.42).max(16.0);
+						ui.add_space(top(form));
 						// The QR code sits beside the form when the window has room for both.
 						let wide = self.sign_in_shows_form()
 							&& self.native.wide() && ui.available_width()
@@ -627,6 +631,13 @@ impl Desktop {
 							);
 							ui.add_space(24.0);
 						});
+						// Present the measured position before the user can click the estimated one.
+						if first_layout
+							&& (top(self.sign_in_height) - top(form)).abs() * ui.pixels_per_point()
+								> 1.0
+						{
+							ui.ctx().request_discard("center the measured sign-in form");
+						}
 					});
 			});
 		let ctx = ui.ctx().clone();

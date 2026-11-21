@@ -5593,7 +5593,6 @@ mod tests {
 	fn biography_message_pill_uses_known_server_and_keeps_original_destination() {
 		let state = test_support::demo_state();
 		let ctx = egui::Context::default();
-		crate::icons::install(&ctx);
 		let mut avatars = Avatars::default();
 		let mut session = ProfileSession::default();
 		let mut formatted = FormatCache::default();

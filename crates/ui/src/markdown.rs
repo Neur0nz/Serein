@@ -5212,7 +5212,6 @@ mod tests {
 		] {
 			for (width, dark) in [(120.0, false), (480.0, true)] {
 				let ctx = egui::Context::default();
-				crate::icons::install(&ctx);
 				ctx.enable_accesskit();
 				ctx.set_visuals(if dark {
 					egui::Visuals::dark()
@@ -5390,7 +5389,6 @@ mod tests {
 		let parsed =
 			Formatted::parse("before ||<#27> https://discord.com/channels/99/777/100|| after");
 		let ctx = egui::Context::default();
-		crate::icons::install(&ctx);
 		ctx.enable_accesskit();
 		let mut images = crate::avatars::Avatars::default();
 		for revealed in [false, true] {
@@ -5541,7 +5539,6 @@ mod tests {
 	#[test]
 	fn dragging_out_of_a_code_block_leaves_the_text_above_it_unselected() {
 		let ctx = egui::Context::default();
-		crate::icons::install(&ctx);
 		let parsed = Formatted::parse("before the block\n```\nalpha\nbravo\n```\nafter the block");
 		let frame = |events| {
 			ctx.run_ui(

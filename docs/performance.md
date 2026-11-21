@@ -19,6 +19,452 @@ change. This workload measures reducer reconciliation. Native startup timing, pr
 memory under interaction, REST scheduling, and comparisons of standard package sizes remain
 unmeasured.
 
+## Desktop startup baseline — November 21, 2026
+
+Baseline `39780338` was the head of the fork's instant-shell and optimistic-writes PR. That
+revision added a three-column skeleton during saved-login restore, a SQLite-backed preview of the
+last navigation and chat, and a handoff to live Gateway state. It also keeps the extension
+start-screen override. The navigation snapshot cap is 512 KiB serialized, 200 guilds and
+2,000 channels. Optimistic writes and close draining make up most of the PR. Its
+eight CI jobs completed successfully. [PR #1](https://github.com/Neur0nz/Serein/pull/1) ·
+[CI](https://github.com/Neur0nz/Serein/actions/runs/44876147177)
+
+The rewritten PR at `5340c069` keeps the skeleton through a deferred connection and clears
+the pending connection on cancel. It shows placeholders until READY verifies the account,
+then loads one remembered channel ID and opens it through normal history if permissions
+allow and the user has stayed on the default view. That removes the original draft's
+roster inference, pre-READY message hydration and duplicate history scheduling. Check for
+a possible intermediate Home frame while the post-READY selection read is pending.
+[Startup rewrite](https://github.com/Neur0nz/Serein/commit/48e82640c6130308376b29624d0417ff04173d54)
+
+### First visible content on offline Linux at `39780338`
+
+Built with pinned Rust 1.99.1 and `cargo build --locked --offline -p serein --features demo
+--bin serein` using the dev profile with `CARGO_PROFILE_DEV_DEBUG=0`. Ran on Linux x86-64,
+kernel 6.18.57, Xeon Platinum 8573C, 4 CPU quota and 16 GiB memory limit. WGPU selected
+Vulkan on llvmpipe in a 1440 × 1000 Xvfb display. Every launch had a private profile or
+reused the initialized no-account profile for the repeat case. The display had a private
+D-Bus session, and the container had networking disabled. Each scenario used one warmup
+and 15 direct process launches. The probe polled X11 about every 4 ms and recorded when the
+window was mapped and when the expected region first contained varied app pixels.
+
+| Scenario | Median mapped | Median visible content | Visible content range |
+| --- | ---: | ---: | ---: |
+| New no-account profile | 1,196 ms | 1,266 ms | 1,166–1,577 ms |
+| Repeat no-account profile | 1,000 ms | 1,080 ms | 882–1,383 ms |
+| Ordinary `--demo` | 1,300 ms | 1,485 ms | 1,306–1,697 ms |
+| Skeleton restore fixture | 1,072 ms | 1,132 ms | 1,006–1,432 ms |
+| Cached restore fixture | 1,139 ms | 1,242 ms | 1,040–1,950 ms |
+
+The restore fixtures use `--demo --demo-login` with `--demo-restoring` or
+`--demo-restoring-cached`. The latter seeds navigation and messages directly. The cases
+ran in groups on one software-rendered debug build. The ranges overlap and the workloads
+differ. Packaged release timing, physical-display presentation, input response, real
+saved-account hydration, Gateway READY and time to fresh messages remain unmeasured.
+
+### Launch phase trace at `5340c069`
+
+The instrumented normal debug build used pinned Rust 1.99.1 in an offline Linux Xvfb
+session with llvmpipe Vulkan and a private profile and D-Bus. There were eight fresh
+no-account launches and eight repeat no-account launches, alternating order after a
+warmup. Fresh used a new profile per trial. Repeat reused an initialized database, a
+default-equivalent preferences row, an empty device file and the Mesa cache. The
+observer and the app use Linux `CLOCK_MONOTONIC` and the observer polls X11 every 4 ms.
+
+| Phase | Fresh median | Repeat median |
+| --- | ---: | ---: |
+| Spawn to entry into Rust main | 83.82 ms | 77.44 ms |
+| Rust main to native setup | 25.86 ms | 4.55 ms |
+| Window and WGPU setup | 192.54 ms | 137.82 ms |
+| Desktop constructor | 356.54 ms | 365.00 ms |
+| First frame through return from `Queue::present` | 515.96 ms | 282.70 ms |
+| Return from present through observed X11 pixels | 111.34 ms | 62.14 ms |
+| Spawn to observed sign-in pixels | 1,368.26 ms | 957.20 ms |
+
+The individual medians come from different trials. In the representative repeat launch,
+83.47 ms went to reaching Rust main, 4.38 ms to pre-window setup, 140.58 ms to native
+setup, 360.55 ms to desktop construction, 0.33 ms to entering the first frame, 265.01 ms
+to producing and presenting the first frame, and 109.37 ms to observing the pixels in X11.
+The total was 963.68 ms. All trials presented on their first root frame.
+
+- **Defer asset work.** Repeat medians inside the constructor were 227.31 ms for Twemoji,
+  52.97 ms for the icon atlas and 12.23 ms for video pipelines. The first frame staged
+  19.86–20.23 MB of CPU-side texture pixels, including 16.52 MB from Twemoji. Gate both
+  preparation and staging on use, and keep first-screen assets available. Upstream #1040
+  already explores demand-driven emoji. [#1040](https://github.com/ViceVerse-cz/Serein/pull/1040)
+- **Profile the first UI pass.** Desktop UI callbacks took 185.97 ms median on repeat.
+  Texture staging took 45.95 ms and the present call took 49.70 ms. These are separate
+  spans. Break UI time down by the view drawn, text layout and any synchronous setup in
+  a release build. Test first visible pixels and the response to a local click separately.
+- **Probe the renderer and storage paths.** Five Vulkan-only repeats chose the same
+  llvmpipe adapter. WGPU instance initialization was 41.44 ms median versus 66.99 ms with
+  Automatic. The end-to-end ranges overlap. Investigate unnecessary backend probing
+  without weakening adapter fallback. SQLite open and initialization took 24.07 ms fresh
+  and 2.11 ms on repeat. Measure migration and lock waits before redesigning persistence.
+
+The minimum path with this renderer includes a window, a surface-compatible device, the
+core UI pipeline, basic text and chrome, and a frame the window system can display. Establish
+a practical floor by measuring a minimal release eframe app and release Serein with the same
+backend, adapter and window configuration on target hardware. The trace covers debug software
+rendering and observed X11 pixels. Input response, physical-display timing and authenticated
+startup remain unmeasured. Credential handling, READY identity and permission checks, and live
+history have separate prerequisites from the first window.
+
+### Release first UI pass with emoji deferred
+
+A local production-feature trace based on `6e5c6c85` leaves Twemoji unloaded during
+sign-in. This prototype isolates the remaining first-frame work. Upstream #1040 supplies
+the proposed emoji implementation. The trace uses locked Rust 1.99.1, fat LTO, offline
+Xvfb and llvmpipe Vulkan at 1×. It reports five fresh profiles and five repeat profiles
+after warmup. Every launch exited cleanly and drew sign-in in one egui pass.
+
+| Launch phase | Fresh median, ms | Repeat median, ms |
+| --- | ---: | ---: |
+| Spawn to Rust main | 65.06 | 69.15 |
+| Rust main to native setup | 15.10 | 3.64 |
+| Native window and WGPU setup | 175.38 | 112.95 |
+| Desktop constructor | 78.82 | 71.32 |
+| First frame through return from `Queue::present` | 264.36 | 62.58 |
+| Present return to observed X11 pixels | 21.16 | 18.88 |
+| Spawn to observed sign-in | 597.58 | 346.94 |
+
+Phase medians come from different launches. Within native setup, WGPU instance
+creation took 95.75 ms fresh and 58.74 ms repeat. The X11 window creation call took
+1.34 ms and 1.22 ms. The first present call alone took 188.36 ms fresh and 31.98 ms
+repeat on this software driver. SQLite open took 13.52 ms fresh and 1.34 ms repeat.
+Measure WGPU backend selection, first presentation and legacy or locked stores as
+separate workloads. Their costs and required behavior differ.
+
+| Phase | Fresh median, ms | Repeat median, ms |
+| --- | ---: | ---: |
+| Eager 64 and 32 px icon layers in constructor | 17.19 | 14.50 |
+| Video converter setup in constructor | 7.42 | 4.05 |
+| First app logic | 0.57 | 0.40 |
+| First app UI | 18.24 | 20.23 |
+| Visible 16 and 24 px icon layers in first app UI | 12.73 | 14.16 |
+| Text layout in first app UI | 2.78 | 3.19 |
+| Translation lookups in first app UI | 1.40 | 1.83 |
+| Native login HTTP client creation in first app UI | 0.17 | 0.16 |
+| First-frame WGPU texture staging | 34.14 | 5.02 |
+
+The spans include their children. All ten launches queued 3,715,072 bytes of CPU-side
+texture data on the first frame. The unused 64 and 32 px icon layers account for
+2,293,760 of those bytes. The visible layers still need preparation on a cold draw.
+The background system-font worker ran, and the default English first pass made zero
+system-font fallback calls. Keep the auth startup ordering and prioritize the measured
+asset work visible at 1×. Compare the separate icon branch against its session-restore
+parent, and repeat the first frame on #1040 after integration.
+[Prototype measurements](https://github.com/Neur0nz/Serein/pull/2) ·
+[Upstream emoji rasters](https://github.com/ViceVerse-cz/Serein/pull/1040)
+
+In one exploratory trace of a click on the first visible Settings gear, the event took
+142 ms to reach the handler and another 23 ms to reach the first present return. The
+Settings view itself took 5.4 ms in that frame. The first observed Settings pixels arrived
+316 ms from input. The observer cannot attribute those pixels to a particular present.
+The fixture dismissed Settings and needed forced exit after timing. Compare focus in a
+sign-in field separately from Settings so input scheduling and the cost of loading the
+full pane can be judged independently.
+
+### First sign-in layout
+
+The first-focus probe on the packaged prototype missed the password field during an
+approximately 35 px layout shift. One click after the field settled reached its focus
+ring 84 ms later. That exploratory run needed forced cleanup after timing, so the planned
+repeat cohort did not run.
+
+Native debug builds at `5340c069` and `9a1e9b34` ran offline with
+`--demo --demo-login=new --demo-light`. At 1× and 1120 × 760, the first parent frame put
+the Log In button at y=473 px, and the settled frame drew it at y=416 px. The candidate
+drew it at y=416 px in both captures. The candidate's first and settled images matched
+the parent's settled image pixel for pixel. The 1.25× and 2× captures also matched their
+settled images. The observer did not catch a separate parent transition at those scales.
+All six demo launches exited cleanly. The capture checks geometry and appearance. The
+packaged tests measure startup latency separately.
+
+### Packaged comparison for icons and sign-in layout
+
+Compared the session-restore parent `5340c069` and the independent startup candidate
+`9a1e9b34`. Built both standard voice-enabled Debian packages with Rust 1.99.1 and the
+locked fat-LTO release profile. Both packages passed the 247-file smoke check. The
+experiment isolates icon-layer loading and sign-in layout from the proposed upstream
+emoji change in #1040.
+
+The Xeon Platinum 8573C runner had a four-CPU quota and 16 GiB of memory. Both builds
+used a private 1440 × 1000 × 24 Xvfb session at 1×, llvmpipe Vulkan (LLVM 19.1.7),
+private D-Bus, and disabled networking. Fresh used new no-account profiles and Mesa
+caches per launch. Repeat reused a warmed profile and Mesa cache per build. The OS
+page cache was left intact. One warmup per build and profile preceded 15 alternating
+pairs. The observer polled the native window approximately every 4 ms. All 60 measured
+launches exited cleanly.
+
+| Profile and milestone | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Fresh, mapped window | 935 (644–1,479) | 845 (639–1,216) | −128 |
+| Fresh, first sign-in pixels | 945 (658–1,497) | 854 (694–1,229) | −121 |
+| Repeat, mapped window | 519 (391–926) | 696 (396–1,580) | +119 |
+| Repeat, first sign-in pixels | 528 (397–934) | 697 (403–1,591) | +121 |
+
+The candidate reached first pixels sooner in 9 of 15 fresh pairs and 2 of 15 repeat
+pairs. A paired change is the median of same-round differences. First sign-in pixels
+can precede the first settled field positions. Use the separate stable-geometry probe
+to measure that milestone. The ranges overlap in this first batch.
+
+#### Repeat launch tail
+
+An independent block sampled 100 repeat launches per build. Five fresh Xvfb and
+D-Bus sessions each ran one warmup per build, then 20 alternating pairs. The starting
+build alternated between sessions. Both packages and the first-visible-pixels observer
+matched the initial batch. All 200 measured launches exited cleanly.
+
+| Repeat sign-in pixels | Parent, ms | Candidate, ms |
+| --- | ---: | ---: |
+| p50 | 523.92 | 498.02 |
+| Nearest-rank p95 | 820.83 | 823.19 |
+| Range | 379.60–997.08 | 363.23–1,110.71 |
+
+The paired median changed by −12.90 ms, with the candidate earlier in 54 of 100
+pairs. Session medians moved in both directions. The initial 15-pair repeat slowdown
+did not reproduce across the larger block. The larger block shows a similar tail for
+these Linux software-rendered builds. The hardware design targets require their own
+reference machine and renderer measurements.
+
+#### First stable sign-in fields
+
+A separate repeat launch probe tracked the two native sign-in fields for 500 ms
+after it first saw them. It compared their observed bounds with the final stable
+geometry at a two-pixel tolerance. A stable suffix needed at least four matching
+samples spanning 75 ms. The result timestamps the start of that suffix. The observer
+sent no input. All eight alternating pairs were usable and all 16 processes exited
+cleanly.
+
+| Repeat sign-in milestone | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Spawn to stable fields | 650 (481–986) | 465 (389–785) | −161 |
+| First fields to stable fields | 31 (23–113) | 0 (0–0) | −31 |
+
+The field bounds moved by about 35 px in each parent launch. The candidate's first
+observed fields matched their settled bounds in every launch. The candidate reached
+stable fields sooner in six of eight pairs. Both warmups needed forced cleanup.
+Excluding the first measured pair after those warmups, the geometry result held in
+all seven pairs and the paired stable-time change was −102 ms. Wall times overlap.
+A zero field shift delay means the first observed fields already matched the final
+geometry at the observer's sampling cadence.
+
+#### Click on the first visible field
+
+In the packaged candidate, a separate XTest observer clicked the center of the
+first detected empty password field within 0.35 ms of its sampling timestamp. The
+click sent no text or form submission. The fresh qualification and all five repeat
+samples showed the focus ring on the intended field. Click to focus pixels on repeat
+was 180 ms median (133–251 ms). All measured launches exited cleanly. The warmup
+needed forced cleanup after the response. The earlier prototype comparison sent its
+successful click after geometry settled, so that timestamp describes a different
+stimulus. The current probe verifies the initial hit target and measures software
+X11 response. It leaves hardware input latency and p95 unmeasured.
+
+#### Process and package resource use
+
+In five separate paired memory launches per profile, all 20 processes exited cleanly.
+The observer read Linux `smaps_rollup` at first content and one second later. RSS
+includes the software driver's process allocations.
+
+| Profile and measurement | Parent median, KiB | Candidate median, KiB | Median paired change, KiB |
+| --- | ---: | ---: | ---: |
+| Fresh RSS at first content | 276,092 | 271,604 | −4,772 |
+| Fresh RSS one second later | 284,992 | 280,784 | −4,680 |
+| Repeat RSS at first content | 263,172 | 258,000 | −5,172 |
+| Repeat RSS one second later | 272,656 | 267,560 | −5,148 |
+
+Repeat process CPU between first content and the one-second sample was 46 (42–49)
+ticks on the parent and 29 (27–32) on the candidate. A tick was 10 ms. Fresh ranges
+overlapped. The interval starts at each build's own first-content timestamp, so these
+values leave CPU before first content and sustained idle behavior unmeasured.
+
+| Package measurement | Parent, bytes | Candidate, bytes | Change, bytes |
+| --- | ---: | ---: | ---: |
+| Executable | 107,272,680 | 107,273,704 | +1,024 |
+| Installed payload | 112,000,982 | 112,002,006 | +1,024 |
+| Compressed Debian package | 57,039,360 | 57,042,440 | +3,080 |
+
+### Minimal release renderer control on Linux
+
+Compared the packaged `afe73481` prototype with a small eframe window using the same
+Rust 1.99.1 release profile, Serein GPU adapter selection, transparent 1120 × 760 window
+and FIFO surface. The control draws one working button. Both processes used private offline
+Xvfb, 1× scaling, llvmpipe Vulkan and the same 4 ms pixel observer. There was one warmup
+per build and profile and 15 alternating measured pairs per profile. Fresh isolated the
+profile and Mesa cache. Repeat reused both. All 60 launches exited cleanly.
+
+| Time to visible content | Control median (range), ms | Serein prototype median (range), ms | Median paired gap, ms |
+| --- | ---: | ---: | ---: |
+| Fresh | 340 (304–616) | 705 (558–875) | 324 |
+| Repeat | 123 (108–321) | 439 (321–641) | 314 |
+
+The paired gap was already 292 ms fresh and 314 ms repeat at the first observed window
+map. The control has a 17,732,176-byte executable, three direct shared-library dependencies,
+and a simpler first view. The package has a 107,296,232-byte executable and 17 direct
+shared-library dependencies. Investigate process and native initialization before changing
+the renderer. These are local software-rendered comparisons. The gap combines binary loading,
+app setup and first-frame work. Physical GPU timing and p95 remain unmeasured.
+
+Three additional interleaved repeat pairs captured glibc 2.41 startup statistics from
+each app's own process. Median glibc startup timer counts were 0.33 million cycles
+for the control and 16.74 million for Serein. Relocation accounted for 0.13 million
+and 14.64 million cycles, respectively. These are glibc's reported timer units. They
+confirm extra linker work, and leave app-initiated library loads, native window and
+GPU setup, and attribution to individual libraries for separate measurements.
+
+### Resident tray Show on offline X11
+
+Used the exact packaged `afe73481` prototype, whose tray path matches `5340c069`.
+A private StatusNotifier watcher registered the real Serein item and verified its Show
+and Quit menu. The observer sent native Close, confirmed the window was unviewable for
+350 ms, invoked the tray activation, and observed the same PID and X11 window ID remap.
+There was one warmup and five measured launches in offline Xvfb on llvmpipe Vulkan.
+Every measured process exited through the real tray Quit action.
+
+| Time from StatusNotifier `Activate` | Median, ms | Range, ms |
+| --- | ---: | ---: |
+| X11 window remapped | 114.3 | 112.7–123.6 |
+| First varied sign-in pixels | 136.8 | 135.6–150.7 |
+
+The window and renderer were already resident. The result includes X11 observation and
+can include pixels retained by the server. Remap alone exceeded the 90 ms resident
+target in every sample. Eframe's hidden repaint delay is on the existing X11 activation
+path. Measure a dedicated wake from the tray event to main-loop logic while preserving
+background throttling. Cold tray, panel focus, scanout and p95 are separate measurements.
+[Tray lifecycle design](startup-design.md#tray-lifecycle-and-failure-handling)
+
+### What the baseline does at launch
+
+| Milestone | Work on the critical path |
+| --- | --- |
+| Before the first window | Claim the single instance, open and initialize SQLite including schema work, read launch preferences and the saved Discord device profile, set up diagnostics, decode the embedded window icon, and create the native window and WGPU renderer. Keep the saved renderer, transparency, window placement and launch mode available in time for the first window. |
+| Before the first visible content | Install base fonts, prepare and queue the Twemoji and icon textures, build the two video conversion pipelines, start the app workers, and run the first UI pass. A configured extension start screen can read and decode its saved layout in that pass. WGPU uploads queued textures before presenting. |
+| Saved session restore | Native credentials and subsequent SQLite reads already run on separate workers. The connection can wait for the saved presence read on the SQLite worker. The preview queues its snapshot and then the selected channel's history on that same worker. The Gateway worker can also await build, device registration, and presence requests before identifying. |
+| Live chat | The Gateway worker prepares READY and its permissions in the background. The UI applies it, reconciles navigation, runs the cached-to-live handoff, and requests recent history. READY, first authenticated paint, and first fresh messages can occur at different times. |
+
+The startup code is in [`main.rs`](../apps/desktop/src/main.rs), the restore path in
+[`sign_in.rs`](../apps/desktop/src/sign_in.rs), and transport setup in
+[`connection.rs`](../apps/desktop/src/connection.rs). The OS startup entry, registered games
+read, G-SYNC probe, and later reads such as appearance and account roster already do their I/O
+off the UI thread. They can still contend for resources during launch.
+
+### Earlier changes and current overlap
+
+- Large READY payloads became bounded and atomic. Later work decoded each guild once for
+  permissions and made the first server-rail pass cheaper. The synthetic 9.5 MiB READY
+  permission workload went from about 28 ms to 17–18 ms. [#155](https://github.com/ViceVerse-cz/Serein/pull/155) ·
+  [#420](https://github.com/ViceVerse-cz/Serein/pull/420)
+- CJK font inflation moved to first demand, and Twemoji decoding stopped using a separate
+  full-size temporary pixel buffer. The current bundled atlas still decodes roughly 5.2 MB
+  of PNG into 16.5 MB of pixels during app creation. An open upstream PR switches to
+  demand-driven glyph textures. Another open PR changes how bundled icons are rasterized.
+  [#349](https://github.com/ViceVerse-cz/Serein/pull/349) ·
+  [#1040](https://github.com/ViceVerse-cz/Serein/pull/1040) ·
+  [#963](https://github.com/ViceVerse-cz/Serein/pull/963)
+- Chat rows were stabilized on their first paint, and static skeletons replaced several
+  spinner or image flashes. Extensions can supply their own start screens. Those changes
+  address different parts of what people see during startup and navigation.
+  [#395](https://github.com/ViceVerse-cz/Serein/pull/395) ·
+  [#1007](https://github.com/ViceVerse-cz/Serein/pull/1007) ·
+  [#1042](https://github.com/ViceVerse-cz/Serein/pull/1042)
+- Desktop now hands its SQLite connection to the cache worker, eliminating a second open.
+  Gateway setup uses a fixed endpoint and READY supplies identity, removing two earlier
+  REST dependencies. The remaining startup requests are conditional.
+  [Store reuse](https://github.com/ViceVerse-cz/Serein/commit/bedb57c0c8def62e736e8a4f03e0a5d248b22126) ·
+  [Gateway startup](https://github.com/ViceVerse-cz/Serein/commit/f72925e507db5aaf706f4db040cdbc8d627a0ab6)
+
+### Follow-up experiments
+
+1. Time database initialization, renderer creation, asset preparation, and submission of
+   the first frame separately. Record when the shell first responds to input and look at
+   frame times through the handoff to live chat. Compare a new profile, an existing
+   current-schema profile, and a migration separately. Test slower or locked storage while
+   preserving the initial window preferences. Video conversion is a good first candidate to
+   move behind media demand. Compare the first video frame too, to check for a playback hitch.
+2. For the rewritten restore flow, test delayed last-conversation reads, manual navigation
+   while the read is pending, and missing or inaccessible selections. Profile the time from
+   worker READY to UI READY, selected channel and fresh history separately. If the selection
+   read competes with settings-only work, investigate deferring those reads.
+3. Measure large READY separately from launch and profile UI sorting and remaining network
+   waits before changing their ordering.
+
+### Video conversion setup on offline Linux
+
+A temporary probe on `ec816a1a` timed the existing `gpu_video::install` call in a native
+`--demo` build with pinned Rust 1.99.1. The converter and eager call are also present at the
+rewritten PR head `5340c069`. The probe alternated the normal launch call, the same call about
+700 ms after the first UI pass, and a no-op control at each point. It recorded the change in
+process RSS and private dirty memory from `/proc/self/smaps_rollup` immediately across the
+call. The renderer was Vulkan on llvmpipe with no hardware GPU.
+
+| Fresh XDG cache, 15 trials each | Setup median (range) | Median RSS delta | Median private dirty delta |
+| --- | ---: | ---: | ---: |
+| At the existing launch call | 12.884 ms (12.267–20.107) | +1,788 KiB | +1,400 KiB |
+| At launch, no-op control | <0.01 ms | +64 KiB | 0 KiB |
+| After the first UI pass | 8.471 ms (6.988–11.335) | +388 KiB | +388 KiB |
+| After the first UI pass, no-op control | <0.01 ms | 0 KiB | 0 KiB |
+
+| Reused XDG cache, 10 trials each | Setup median (range) | Median RSS delta | Median private dirty delta |
+| --- | ---: | ---: | ---: |
+| At the existing launch call | 9.098 ms (8.390–11.278) | +1,102 KiB | +776 KiB |
+| At launch, no-op control | <0.01 ms | +32 KiB | 0 KiB |
+| After the first UI pass | 8.071 ms (7.228–11.187) | +618 KiB | +618 KiB |
+| After the first UI pass, no-op control | <0.01 ms | 0 KiB | 0 KiB |
+
+The fresh trials used new XDG cache directories. The reused trials shared a cache directory
+within each mode after one warmup. Mesa populated the cache. The probe did not attribute
+individual shader hits.
+
+The wgpu allocator reported zero change in its managed allocated and reserved bytes. The
+RSS sample includes process code and driver allocations. Dedicated hardware VRAM, transient
+memory peaks and decoded video textures are outside this sample. The native first-content
+timing ranges overlapped. This component measurement leaves release behavior and time from
+media request to first video frame open.
+
+### When to load optional work
+
+Serein has priority and admission rules within individual subsystems. The artwork worker
+chooses viewer work ahead of queued inline work and caps concurrent decoding. An admitted
+job can still occupy a slot. The rewritten PR limits classified background REST requests to
+two of the four shared slots. Speculative reads decline work when capacity or a route is busy.
+The desktop unwraps `Command::Prefetch` before it reaches that classification, so hover
+prefetch still uses ordinary admission. SQLite uses one ordered worker and ordinary Tokio
+background tasks have no application-wide admission rule. [Artwork](../apps/desktop/src/avatars.rs) ·
+[Desktop dispatch](https://github.com/Neur0nz/Serein/blob/5340c069fc42616ddd01836c1cf27a1028ebfdd8/apps/desktop/src/connection.rs#L1325) ·
+[REST reserve](https://github.com/Neur0nz/Serein/blob/5340c069fc42616ddd01836c1cf27a1028ebfdd8/crates/discord-api/src/lib.rs#L687)
+
+Start optional media setup when playback or viewing is requested. Video decode and stream
+negotiation already have worker paths, which gives shader creation a chance to complete while
+the first picture is being prepared. Keep one setup in flight, publish the ready result without
+blocking a paint pass, and measure input-to-first-video-frame. The RGBA upload path can bypass
+YUV shaders, and NV12 and I420 can be prepared independently if measurements justify doing so.
+[Video conversion](../apps/desktop/src/gpu_video.rs) · [Inline play](../apps/desktop/src/video.rs) ·
+[Watch stream](../apps/desktop/src/watch.rs)
+
+For a task that actually benefits from post-launch warmup, admit one bounded job only after
+the relevant foreground work settles. Coalesce duplicate requests and let an explicit user
+action adopt the running result or take priority over queued work. Avoid starting another unit
+when the app is actively rendering or servicing interaction. A worker can still contend for
+CPU, disk, or the graphics driver once a job starts, so measure responsiveness during warmup.
+
+| Work | When to load it | Reuse across launches |
+| --- | --- | --- |
+| Window settings and local storage | Read the settings that choose the renderer, placement and initial appearance early. Profile migration and current-schema opens separately before moving the remaining work. | Use the existing saved preferences. Measure skipping repeat migration checks before adding a second source of truth. |
+| Fonts, emoji and icons | Keep first-view assets available. CJK and installed-font enumeration already load on demand. Measure emoji after upstream #1040. | Generate fixed indexes, icon assets and common size variants at build time if they are measured bottlenecks. Keep fonts and GPU textures tied to the active scale and renderer. |
+| Extensions | Keep the granted startup screen available early when configured. Start work specific to other extension views when they are used. | The granted start screen already has a bounded saved descriptor. Profile read and decode before changing its representation, and preserve disable, revoke and removal behavior. |
+| Activity, updates and settings | Investigate deferring automatic update checks until after startup, and loading OS autostart status, GIF favorites and registered games when their settings or features actually need them. Explicit actions still need an immediate path. | Continue using existing settings and approved cache formats. Avoid writing an extra copy just to move a small read. |
+| Artwork and session navigation | Prioritize artwork for the visible viewport and history for the selected channel. Defer optional scans or hydration for superseded selections. | Use the existing bounded artwork cache and the rewritten PR's account-scoped last-conversation record. |
+
+The renderer and video paths currently pass `cache: None` to wgpu. wgpu 30 exposes a
+persisted pipeline cache only on Vulkan. First measure the installed driver's cold and warm
+cache with the same adapter. Consider an application cache only if it adds a measurable gain
+and can be rebuilt on miss. Any retained blob should be generated locally, versioned for the
+adapter, driver and pipeline, bounded, and written atomically off the launch path.
+[wgpu pipeline cache](https://docs.rs/wgpu/30.0.1/wgpu/struct.PipelineCache.html) ·
+[Mesa driver cache](https://docs.mesa3d.org/envvars.html#mesa-shader-cache-dir)
+
 ## Voice connection ping
 
 Compared `5a11f95b` with the voice ping change using locked Rust 1.99.1 release builds
