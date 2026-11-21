@@ -152,13 +152,13 @@ and late upload results to the live graphics device before supporting replacemen
 that device. Consider core renderer eviction only if idle memory savings justify a
 measured slower Show.
 
-On a quiet X11 tray Show, the callback requests an egui repaint to deliver the
-activation. Eframe delays invisible-window repaint requests by at least 100 ms.
-Measure the native tray request, remap and first visible pixels separately. Test
-an urgent main-loop activation for explicit Show and keep ordinary hidden repaints
-throttled. Use a private StatusNotifier host for X11 protocol tests and a real desktop
-panel to verify focus and compositor behavior.
-[Hidden repaint scheduling](https://github.com/Neur0nz/Serein/blob/5340c069fc42616ddd01836c1cf27a1028ebfdd8/vendor/egui/eframe/src/native/run.rs#L369)
+An explicit X11 tray Show queues the normal tray event and immediately wakes the
+main loop for the existing root window. The event goes through the normal redraw
+and close handling. Ordinary invisible-window repaint requests retain eframe's
+100 ms throttle. Measure the native tray request, remap, first visible pixels and
+first input response separately. Use a private StatusNotifier host for X11
+protocol tests and a real desktop panel to verify focus and compositor behavior.
+[Resident tray measurements](performance.md#resident-tray-show-on-offline-x11)
 
 Use one native event loop for cold tray mode. The session pump must wake on both
 worker completions and the nearest pending deadline for credential timeouts, saves,
