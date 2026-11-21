@@ -162,6 +162,48 @@ The fixture dismissed Settings and needed forced exit after timing. Compare focu
 sign-in field separately from Settings so input scheduling and the cost of loading the
 full pane can be judged independently.
 
+### Minimal release renderer control on Linux
+
+Compared the packaged `afe73481` prototype with a small eframe window using the same
+Rust 1.99.1 release profile, Serein GPU adapter selection, transparent 1120 × 760 window
+and FIFO surface. The control draws one working button. Both processes used private offline
+Xvfb, 1× scaling, llvmpipe Vulkan and the same 4 ms pixel observer. There was one warmup
+per build and profile and 15 alternating measured pairs per profile. Fresh isolated the
+profile and Mesa cache. Repeat reused both. All 60 launches exited cleanly.
+
+| Time to visible content | Control median (range), ms | Serein prototype median (range), ms | Median paired gap, ms |
+| --- | ---: | ---: | ---: |
+| Fresh | 340 (304–616) | 705 (558–875) | 324 |
+| Repeat | 123 (108–321) | 439 (321–641) | 314 |
+
+The paired gap was already 292 ms fresh and 314 ms repeat at the first observed window
+map. The control has a 17,732,176-byte executable, three direct shared-library dependencies,
+and a simpler first view. The package has a 107,296,232-byte executable and 17 direct
+shared-library dependencies. Investigate process and native initialization before changing
+the renderer. These are local software-rendered comparisons. The gap combines binary loading,
+app setup and first-frame work. Physical GPU timing and p95 remain unmeasured.
+
+### Resident tray Show on offline X11
+
+Used the exact packaged `afe73481` prototype, whose tray path matches `5340c069`.
+A private StatusNotifier watcher registered the real Serein item and verified its Show
+and Quit menu. The observer sent native Close, confirmed the window was unviewable for
+350 ms, invoked the tray activation, and observed the same PID and X11 window ID remap.
+There was one warmup and five measured launches in offline Xvfb on llvmpipe Vulkan.
+Every measured process exited through the real tray Quit action.
+
+| Time from StatusNotifier `Activate` | Median, ms | Range, ms |
+| --- | ---: | ---: |
+| X11 window remapped | 114.3 | 112.7–123.6 |
+| First varied sign-in pixels | 136.8 | 135.6–150.7 |
+
+The window and renderer were already resident. The result includes X11 observation and
+can include pixels retained by the server. Remap alone exceeded the 90 ms resident
+target in every sample. Eframe's hidden repaint delay is on the existing X11 activation
+path. Measure a dedicated wake from the tray event to main-loop logic while preserving
+background throttling. Cold tray, panel focus, scanout and p95 are separate measurements.
+[Tray lifecycle design](startup-design.md#tray-lifecycle-and-failure-handling)
+
 ### What the baseline does at launch
 
 | Milestone | Work on the critical path |
