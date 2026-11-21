@@ -3,9 +3,12 @@
 mod fallback;
 mod output;
 mod source;
-use std::sync::{
-	Arc, Mutex,
-	atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+use std::{
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+	},
+	task::Poll,
 };
 use ui::{VideoCommand, VideoState, VideoUi};
 
@@ -75,11 +78,21 @@ pub struct Video {
 /// In-flight poster ceiling; excess requests retry while still visible.
 const POSTER_JOBS_MAX: usize = 32;
 impl Video {
+	pub fn new(converter: Option<Arc<crate::gpu_video::Converter>>) -> Self {
+		let mut video = Self::default();
+		video.texture = crate::gpu_video::VideoTexture::new(converter);
+		video
+	}
+
 	pub fn stop(&mut self) {
+		self.cancel_playback();
+		self.texture.clear();
+	}
+
+	fn cancel_playback(&mut self) {
 		if let Some(session) = self.session.take() {
 			session.cancelled.store(true, Ordering::Release);
 		}
-		self.texture = Default::default();
 		if let Some(requests) = &self.requests {
 			requests.send_replace(None);
 		}
@@ -113,18 +126,54 @@ impl Video {
 		let Some(session) = &self.session else {
 			return;
 		};
-		if let Ok(mut update) = session.update.try_lock() {
+		let frame = {
+			let mut update = match session.update.try_lock() {
+				Ok(update) => update,
+				Err(std::sync::TryLockError::WouldBlock) if player.active.is_some() => {
+					// A paused decoder may never publish another wake for this frame.
+					ctx.request_repaint();
+					return;
+				}
+				Err(_) => return,
+			};
 			player.state = update.state;
 			player.position = update.position;
 			player.duration = update.duration;
-			let frame = update.frame.take();
-			drop(update);
-			if let Some(picture) = frame
-				&& player.active.is_some()
-				&& let Some(texture) = self.texture.upload(ctx, "inline-video", picture.borrow())
-			{
-				player.show_frame(texture);
+			if player.active.is_none() {
+				update.frame = None;
+				return;
 			}
+			if session.seek.load(Ordering::Acquire) != u64::MAX {
+				return;
+			}
+			match update
+				.frame
+				.as_ref()
+				.map(|picture| self.texture.prepare(ctx, &picture.borrow()))
+			{
+				Some(Poll::Pending) => {
+					if self.texture.texture().is_none()
+						&& !matches!(player.state, VideoState::Failed(_))
+					{
+						player.state = VideoState::Loading;
+					}
+					return;
+				}
+				Some(Poll::Ready(Err(error))) => Err(error),
+				_ => Ok(update.frame.take()),
+			}
+		};
+		match frame {
+			Ok(Some(picture)) => {
+				if let Some(texture) = self.texture.upload(ctx, "inline-video", picture.borrow()) {
+					player.show_frame(texture);
+				}
+			}
+			Err(error) => {
+				self.cancel_playback();
+				player.state = VideoState::Failed(error);
+			}
+			Ok(None) => {}
 		}
 	}
 	pub fn command(
@@ -222,6 +271,10 @@ impl Video {
 			size: attachment.size as usize,
 		}));
 		self.session = Some(session);
+		// Linux and macOS attachment decoders emit planar video. Overlap pipeline
+		// creation with the accepted request's decoder and audio setup.
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		let _ = self.texture.prepare_planar(ctx);
 		Ok(())
 	}
 	/// Queues one batch of idle-stage posters; failures surface through `poll`,
@@ -531,17 +584,18 @@ fn play_decoded(
 			if session.cancelled.load(Ordering::Acquire) {
 				return Ok(());
 			}
-			let seek = session.seek.swap(u64::MAX, Ordering::AcqRel);
-			if seek != u64::MAX {
-				// Release the old device/ring before a potentially blocking native seek.
-				drop(output);
+			if session.seek.load(Ordering::Acquire) != u64::MAX {
+				let mut update = session.update.lock().map_err(|_| "Video update failed")?;
+				let seek = session.seek.swap(u64::MAX, Ordering::AcqRel);
 				target = (seek as f64 / 1000.).min((info.duration - 0.001).max(0.));
 				seeking = true;
-				if let Ok(mut update) = session.update.lock() {
-					update.frame = None;
-					update.state = VideoState::Loading;
-					update.position = target;
-				}
+				// Clear the pending picture before poll can see the seek as consumed.
+				update.frame = None;
+				update.state = VideoState::Loading;
+				update.position = target;
+				drop(update);
+				// Release the old device/ring before a potentially blocking native seek.
+				drop(output);
 				ctx.request_repaint();
 				continue 'seek;
 			}
@@ -699,8 +753,47 @@ fn play_decoded(
 }
 
 #[cfg(test)]
-mod poster_tests {
+mod tests {
 	use super::*;
+
+	#[test]
+	fn seek_waits_for_the_decoder_to_replace_an_unread_picture() {
+		use platform::video::{Color, Layout, Picture};
+
+		let state = test_support::video_demo_state();
+		let message = state.timeline.get(model::Id(601)).unwrap();
+		let mut player = VideoUi::default();
+		player.active = Some((message.channel, message.id, message.attachments[0].clone()));
+		let ctx = eframe::egui::Context::default();
+		let mut video = Video::default();
+		let session = Arc::new(Session::new(1.0));
+		video.session = Some(session.clone());
+		let picture = Picture {
+			width: 2,
+			height: 2,
+			layout: Layout::Nv12,
+			color: Color::WEBRTC,
+			rotation: 0,
+			data: vec![128; 6],
+		};
+		session.update.lock().unwrap().frame = Some(picture);
+
+		session.seek.store(1_000, Ordering::Release);
+		video.poll(&mut player, &ctx);
+		assert!(session.update.lock().unwrap().frame.is_some());
+		assert!(video.texture.texture().is_none());
+
+		{
+			let mut update = session.update.lock().unwrap();
+			let replacement = update.frame.take().unwrap().with_data(vec![144; 6]);
+			session.seek.store(u64::MAX, Ordering::Release);
+			update.frame = Some(replacement);
+		}
+		video.poll(&mut player, &ctx);
+		assert!(session.update.lock().unwrap().frame.is_none());
+		assert!(video.texture.texture().is_some());
+	}
+
 	/// Small frames pass through untouched; large ones shrink to the poster edge averaged.
 	#[test]
 	fn downscale_shrinks_and_averages() {

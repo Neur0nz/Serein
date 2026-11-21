@@ -12,6 +12,7 @@ use eframe::egui;
 use model::{Id, notification_preferences::Sound};
 use std::{
 	sync::{Arc, OnceLock, mpsc},
+	task::Poll,
 	time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -378,6 +379,7 @@ pub struct Voice {
 	retiring: Option<mpsc::Receiver<()>>,
 	device_scan: Option<mpsc::Receiver<Result<discord_voice::audio::DeviceList, &'static str>>>,
 	camera_scan: Option<mpsc::Receiver<Result<discord_voice::camera::DeviceList, &'static str>>>,
+	video_converter: Option<Arc<crate::gpu_video::Converter>>,
 	/// Remote camera textures behind `ui.voice_remote_video`, by user.
 	remote_textures: Vec<(Id, crate::gpu_video::VideoTexture)>,
 	/// A joined call failed; the next poll plays the leave cue a hangup would.
@@ -388,6 +390,13 @@ pub struct Voice {
 	pub gateway_check: bool,
 }
 impl Voice {
+	pub fn new(converter: Option<Arc<crate::gpu_video::Converter>>) -> Self {
+		let mut voice = Self::default();
+		voice.watch = crate::watch::Watch::new(converter.clone());
+		voice.video_converter = converter;
+		voice
+	}
+
 	pub fn stop(&mut self) {
 		self.camera_test = None;
 		self.mic_preview = None;
@@ -975,6 +984,7 @@ impl Voice {
 		state: &mut State,
 		ui: &mut ui::MessagingUi,
 		ctx: &egui::Context,
+		video_visible: bool,
 	) -> Option<Command> {
 		self.reap();
 		if !state.demo {
@@ -1350,37 +1360,8 @@ impl Voice {
 					ctx.request_repaint();
 				}
 			}
-			// Uploading is a plane copy into GPU staging, so it runs under the slot lock
-			// instead of cloning each picture out first.
-			if let Ok(mut slot) = live.remote_video.try_lock() {
-				for (user, picture, dirty) in slot.iter_mut() {
-					if !std::mem::take(dirty) {
-						continue;
-					}
-					let user = Id(*user);
-					let index = match self.remote_textures.iter().position(|(id, _)| *id == user) {
-						Some(index) => index,
-						None if self.remote_textures.len() < MAX_REMOTE_VIDEO => {
-							self.remote_textures.push((user, Default::default()));
-							self.remote_textures.len() - 1
-						}
-						None => continue,
-					};
-					let name = format!("remote-camera-{}", user.0);
-					let Some(texture) =
-						self.remote_textures[index]
-							.1
-							.upload(ctx, &name, picture.borrow())
-					else {
-						continue;
-					};
-					match ui.voice_remote_video.iter_mut().find(|(id, _)| *id == user) {
-						Some((_, shown)) => *shown = texture,
-						None => ui.voice_remote_video.push((user, texture)),
-					}
-				}
-			}
-			// Cameras announced off, or participants who left, release their textures.
+			// Cameras announced off, or participants who left, release their pictures before
+			// any upload can request the shared video converter.
 			let visible: Vec<Id> = state
 				.voice
 				.active
@@ -1395,8 +1376,49 @@ impl Voice {
 				.unwrap_or_default();
 			ui.voice_remote_video.retain(|(id, _)| visible.contains(id));
 			self.remote_textures.retain(|(id, _)| visible.contains(id));
-			if let Ok(mut pictures) = live.remote_video.try_lock() {
-				pictures.retain(|(id, _, _)| visible.contains(&Id(*id)));
+			// Uploading copies planes into GPU staging under the slot lock to reuse each buffer.
+			let slots = live.remote_video.try_lock();
+			if let Ok(mut slot) = slots {
+				slot.retain(|(id, _, _)| visible.contains(&Id(*id)));
+				for (user, picture, dirty) in slot.iter_mut() {
+					if !video_visible || !*dirty || failure.is_some() {
+						continue;
+					}
+					let user = Id(*user);
+					let index = match self.remote_textures.iter().position(|(id, _)| *id == user) {
+						Some(index) => index,
+						None if self.remote_textures.len() < MAX_REMOTE_VIDEO => {
+							self.remote_textures.push((
+								user,
+								crate::gpu_video::VideoTexture::new(self.video_converter.clone()),
+							));
+							self.remote_textures.len() - 1
+						}
+						None => continue,
+					};
+					let video = &mut self.remote_textures[index].1;
+					let picture = picture.borrow();
+					let Poll::Ready(result) = video.prepare(ctx, &picture) else {
+						continue;
+					};
+					*dirty = false;
+					if result.is_err() {
+						continue;
+					}
+					let name = format!("remote-camera-{}", user.0);
+					let Some(texture) = video.upload(ctx, &name, picture) else {
+						continue;
+					};
+					match ui.voice_remote_video.iter_mut().find(|(id, _)| *id == user) {
+						Some((_, shown)) => *shown = texture,
+						None => ui.voice_remote_video.push((user, texture)),
+					}
+				}
+			} else if video_visible
+				&& !visible.is_empty()
+				&& matches!(slots, Err(std::sync::TryLockError::WouldBlock))
+			{
+				ctx.request_repaint();
 			}
 		}
 		if failure.is_none()
@@ -1486,8 +1508,14 @@ impl Voice {
 		if let Some(command) = self.screen.poll(runtime, state, ui, ctx, call) {
 			return Some(command);
 		}
-		self.watch
-			.poll(runtime, state, ui, ctx, watched, stream_audio)
+		self.watch.poll(
+			runtime,
+			state,
+			ui,
+			(ctx, video_visible),
+			watched,
+			stream_audio,
+		)
 	}
 	fn poll_mic_preview(&mut self, state: &State, ui: &mut ui::MessagingUi, ctx: &egui::Context) {
 		if state.demo
@@ -2748,7 +2776,7 @@ mod tests {
 		state.gateway_connected = false;
 		assert!(
 			manager
-				.poll(&runtime, &mut state, &mut ui, &context)
+				.poll(&runtime, &mut state, &mut ui, &context, true)
 				.is_none()
 		);
 		assert!(manager.pending.is_none());
@@ -2757,13 +2785,13 @@ mod tests {
 		// Nothing is sent while offline.
 		assert!(
 			manager
-				.poll(&runtime, &mut state, &mut ui, &context)
+				.poll(&runtime, &mut state, &mut ui, &context, true)
 				.is_none()
 		);
 		// Back online, the same attempt asks again.
 		state.gateway_connected = true;
 		assert!(is_join(
-			&manager.poll(&runtime, &mut state, &mut ui, &context)
+			&manager.poll(&runtime, &mut state, &mut ui, &context, true)
 		));
 		assert_eq!(
 			state
@@ -2847,7 +2875,7 @@ mod tests {
 		let mut ui = ui::MessagingUi::default();
 		let context = egui::Context::default();
 		assert!(matches!(
-			manager.poll(&runtime, &mut state, &mut ui, &context),
+			manager.poll(&runtime, &mut state, &mut ui, &context, true),
 			Some(Command::Voice(voice::Command::AbandonSession {
 				channel: Id(25),
 				..
@@ -2860,7 +2888,7 @@ mod tests {
 		state.generation += 1;
 		assert!(
 			manager
-				.poll(&runtime, &mut state, &mut ui, &context)
+				.poll(&runtime, &mut state, &mut ui, &context, true)
 				.is_none()
 		);
 		assert!(manager.pending.is_none());
@@ -2913,7 +2941,7 @@ mod tests {
 		let context = egui::Context::default();
 		assert!(
 			manager
-				.poll(&runtime, &mut state, &mut ui, &context)
+				.poll(&runtime, &mut state, &mut ui, &context, true)
 				.is_none()
 		);
 		assert!(state.start_call(Id(22), false).is_some());
@@ -3274,7 +3302,7 @@ mod tests {
 			let ctx = egui::Context::default();
 			assert!(
 				manager
-					.poll(&runtime, &mut state, &mut view, &ctx)
+					.poll(&runtime, &mut state, &mut view, &ctx, true)
 					.is_none()
 			);
 			assert!(
@@ -3290,7 +3318,7 @@ mod tests {
 					.is_none()
 			);
 			assert!(
-				matches!(manager.poll(&runtime, &mut state, &mut view, &ctx), Some(Command::Voice(voice::Command::AbandonSession { channel:Id(22), request:r })) if r == request)
+				matches!(manager.poll(&runtime, &mut state, &mut view, &ctx, true), Some(Command::Voice(voice::Command::AbandonSession { channel:Id(22), request:r })) if r == request)
 			);
 			assert!(manager.pending.is_none() && manager.live.is_none());
 			drop(closing);

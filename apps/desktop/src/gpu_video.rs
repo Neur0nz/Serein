@@ -5,30 +5,13 @@
 //! fallback in [`platform::video::Picture::to_rgba`] feeds an ordinary egui texture.
 use eframe::{egui, egui_wgpu, wgpu};
 use platform::video::{Layout, Picture};
-use std::sync::{Arc, OnceLock};
-
-/// The window's one wgpu device; every video texture converts through it.
-static CONVERTER: OnceLock<Arc<Converter>> = OnceLock::new();
-
-/// Builds the converter for the window's renderer; later calls keep the first one.
-pub fn install(state: &egui_wgpu::RenderState) {
-	CONVERTER.get_or_init(|| Converter::new(state));
-}
-
-/// Frees textures retired since the last call. Call once at the start of each frame: a
-/// texture dropped during a frame may still be referenced by that frame's queued shapes,
-/// so its egui registration outlives the paint and is removed one frame later.
-pub fn collect() {
-	if let Some(converter) = CONVERTER.get() {
-		let retired = std::mem::take(&mut *converter.retired.lock());
-		if !retired.is_empty() {
-			let mut renderer = converter.renderer.write();
-			for id in retired {
-				renderer.free_texture(&id);
-			}
-		}
-	}
-}
+use std::{
+	sync::{
+		Arc, OnceLock,
+		atomic::{AtomicBool, Ordering},
+	},
+	task::Poll,
+};
 
 const SHADER: &str = r"
 struct Params {
@@ -88,22 +71,85 @@ fn fs_i420(in: Varyings) -> @location(0) vec4<f32> {
 }
 ";
 
-/// Shared pipelines plus the renderer handles every [`VideoTexture`] uploads through.
+/// Video resources shared by textures on one desktop renderer.
 pub struct Converter {
 	device: wgpu::Device,
 	queue: wgpu::Queue,
 	renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
-	layout: wgpu::BindGroupLayout,
-	nv12: wgpu::RenderPipeline,
-	i420: wgpu::RenderPipeline,
-	sampler: wgpu::Sampler,
-	/// Dropped textures awaiting [`collect`]; at most one frame's worth.
+	yuv: OnceLock<Result<Yuv, &'static str>>,
+	preparing: AtomicBool,
+	/// Dropped textures awaiting [`Self::collect`]; at most one frame's worth.
 	retired: egui::mutex::Mutex<Vec<egui::TextureId>>,
 }
 
 impl Converter {
 	pub fn new(state: &egui_wgpu::RenderState) -> Arc<Self> {
-		let device = &state.device;
+		Arc::new(Self {
+			device: state.device.clone(),
+			queue: state.queue.clone(),
+			renderer: state.renderer.clone(),
+			yuv: OnceLock::new(),
+			preparing: AtomicBool::new(false),
+			retired: Default::default(),
+		})
+	}
+
+	/// Frees textures retired since the last call. Queued shapes may still use an id
+	/// dropped during their frame, so the registration survives until the next frame.
+	pub fn collect(&self) {
+		let retired = std::mem::take(&mut *self.retired.lock());
+		if !retired.is_empty() {
+			let mut renderer = self.renderer.write();
+			for id in retired {
+				renderer.free_texture(&id);
+			}
+		}
+	}
+
+	fn prepare(self: &Arc<Self>, ctx: &egui::Context) -> Poll<Result<(), &'static str>> {
+		if let Some(result) = self.yuv.get() {
+			return Poll::Ready(result.as_ref().map(|_| ()).map_err(|error| *error));
+		}
+		if !self.preparing.swap(true, Ordering::Relaxed) {
+			let device = self.device.clone();
+			let owner = Arc::downgrade(self);
+			let wake = ctx.clone();
+			// Driver compilation can block. Keep it off the renderer and the app's
+			// shutdown drain, and publish only to the device that requested it.
+			let thread = std::thread::Builder::new()
+				.name("serein-video-pipelines".into())
+				.spawn(move || {
+					let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+						Yuv::new(&device)
+					}))
+					.map_err(|_| "Video color conversion unavailable");
+					if let Some(owner) = owner.upgrade() {
+						if let Err(error) = &result {
+							eprintln!("[Serein] {error}");
+						}
+						let _ = owner.yuv.set(result);
+						wake.request_repaint_of(egui::ViewportId::ROOT);
+					}
+				});
+			if let Err(error) = thread {
+				eprintln!("[Serein] Could not start video pipeline worker ({error})");
+				let _ = self.yuv.set(Err("Could not start video pipeline worker"));
+				return Poll::Ready(Err("Could not start video pipeline worker"));
+			}
+		}
+		Poll::Pending
+	}
+}
+
+struct Yuv {
+	layout: wgpu::BindGroupLayout,
+	nv12: wgpu::RenderPipeline,
+	i420: wgpu::RenderPipeline,
+	sampler: wgpu::Sampler,
+}
+
+impl Yuv {
+	fn new(device: &wgpu::Device) -> Self {
 		let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("video-yuv"),
 			source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -180,18 +226,16 @@ impl Converter {
 			min_filter: wgpu::FilterMode::Linear,
 			..Default::default()
 		});
-		Arc::new(Self {
-			device: device.clone(),
-			queue: state.queue.clone(),
-			renderer: state.renderer.clone(),
+		Self {
 			nv12: pipeline("fs_nv12"),
 			i420: pipeline("fs_i420"),
 			layout,
 			sampler,
-			retired: Default::default(),
-		})
+		}
 	}
+}
 
+impl Converter {
 	fn texture(
 		&self,
 		label: &str,
@@ -271,12 +315,44 @@ impl Drop for Gpu {
 /// One on-screen video picture: the latest frame as an egui texture.
 #[derive(Default)]
 pub struct VideoTexture {
+	converter: Option<Arc<Converter>>,
 	gpu: Option<Gpu>,
 	cpu: Option<egui::TextureHandle>,
 	size: egui::Vec2,
 }
 
 impl VideoTexture {
+	pub fn new(converter: Option<Arc<Converter>>) -> Self {
+		Self {
+			converter,
+			..Self::default()
+		}
+	}
+
+	pub fn clear(&mut self) {
+		self.gpu = None;
+		self.cpu = None;
+		self.size = egui::Vec2::ZERO;
+	}
+
+	/// Keep the decoder's bounded picture slot intact while preparation is pending.
+	pub fn prepare(
+		&self,
+		ctx: &egui::Context,
+		picture: &Picture<&[u8]>,
+	) -> Poll<Result<(), &'static str>> {
+		if picture.layout != Layout::Rgba && picture.is_valid() {
+			return self.prepare_planar(ctx);
+		}
+		Poll::Ready(Ok(()))
+	}
+
+	pub fn prepare_planar(&self, ctx: &egui::Context) -> Poll<Result<(), &'static str>> {
+		self.converter
+			.as_ref()
+			.map_or(Poll::Ready(Ok(())), |converter| converter.prepare(ctx))
+	}
+
 	pub fn texture(&self) -> Option<egui::load::SizedTexture> {
 		let id = match (&self.gpu, &self.cpu) {
 			(Some(gpu), _) => gpu.id,
@@ -297,8 +373,8 @@ impl VideoTexture {
 			return None;
 		}
 		let (width, height) = picture.display_size();
-		match CONVERTER.get() {
-			Some(converter) => self.upload_gpu(converter, name, &picture),
+		match self.converter.as_ref() {
+			Some(converter) => Self::upload_gpu(&mut self.gpu, converter, name, &picture)?,
 			None => {
 				let (width, height, rgba) = picture.to_rgba()?;
 				let image = egui::ColorImage::from_rgba_premultiplied(
@@ -317,17 +393,26 @@ impl VideoTexture {
 		self.texture()
 	}
 
-	fn upload_gpu(&mut self, converter: &Arc<Converter>, name: &str, picture: &Picture<&[u8]>) {
+	fn upload_gpu(
+		gpu: &mut Option<Gpu>,
+		converter: &Arc<Converter>,
+		name: &str,
+		picture: &Picture<&[u8]>,
+	) -> Option<()> {
+		let yuv = if picture.layout == Layout::Rgba {
+			None
+		} else {
+			Some(converter.yuv.get()?.as_ref().ok()?)
+		};
 		let display = picture.display_size();
-		let resized = self
-			.gpu
+		let resized = gpu
 			.as_ref()
 			.is_none_or(|gpu| (gpu.output.width(), gpu.output.height()) != display);
 		if resized {
 			let output = converter.texture(name, display, wgpu::TextureFormat::Rgba8Unorm, true);
 			let view = output.create_view(&wgpu::TextureViewDescriptor::default());
 			let mut renderer = converter.renderer.write();
-			match &mut self.gpu {
+			match gpu {
 				Some(gpu) => {
 					renderer.update_egui_texture_from_wgpu_texture(
 						&converter.device,
@@ -343,7 +428,7 @@ impl VideoTexture {
 						&view,
 						wgpu::FilterMode::Linear,
 					);
-					self.gpu = Some(Gpu {
+					*gpu = Some(Gpu {
 						converter: converter.clone(),
 						id,
 						output,
@@ -352,24 +437,22 @@ impl VideoTexture {
 				}
 			}
 		}
-		let Some(gpu) = &mut self.gpu else {
-			return;
-		};
-		if picture.layout == Layout::Rgba {
+		let gpu = gpu.as_mut()?;
+		let Some(yuv) = yuv else {
 			if picture.rotation == 0 {
 				converter.write(&gpu.output, picture.data, picture.width * 4);
 			} else if let Some((width, _, rgba)) = picture.to_rgba() {
 				converter.write(&gpu.output, &rgba, width * 4);
 			}
-			return;
-		}
+			return Some(());
+		};
 		let size = (picture.width, picture.height);
 		if gpu
 			.planes
 			.as_ref()
 			.is_none_or(|planes| planes.layout != picture.layout || planes.size != size)
 		{
-			gpu.planes = Some(planes(converter, picture.layout, size));
+			gpu.planes = Some(planes(converter, yuv, picture.layout, size));
 		}
 		let planes = gpu.planes.as_ref().expect("planes allocated");
 		let (chroma_width, chroma_height) = picture.chroma_size();
@@ -418,17 +501,18 @@ impl VideoTexture {
 				multiview_mask: None,
 			});
 			pass.set_pipeline(match picture.layout {
-				Layout::Nv12 => &converter.nv12,
-				_ => &converter.i420,
+				Layout::Nv12 => &yuv.nv12,
+				_ => &yuv.i420,
 			});
 			pass.set_bind_group(0, &planes.bind_group, &[]);
 			pass.draw(0..3, 0..1);
 		}
 		converter.queue.submit([encoder.finish()]);
+		Some(())
 	}
 }
 
-fn planes(converter: &Converter, layout: Layout, size: (u32, u32)) -> Planes {
+fn planes(converter: &Converter, yuv: &Yuv, layout: Layout, size: (u32, u32)) -> Planes {
 	let chroma_size = (size.0.div_ceil(2), size.1.div_ceil(2));
 	let luma = converter.texture("video-luma", size, wgpu::TextureFormat::R8Unorm, false);
 	let chroma = match layout {
@@ -458,7 +542,7 @@ fn planes(converter: &Converter, layout: Layout, size: (u32, u32)) -> Planes {
 		.device
 		.create_bind_group(&wgpu::BindGroupDescriptor {
 			label: Some("video-yuv"),
-			layout: &converter.layout,
+			layout: &yuv.layout,
 			entries: &[
 				wgpu::BindGroupEntry {
 					binding: 0,
@@ -466,7 +550,7 @@ fn planes(converter: &Converter, layout: Layout, size: (u32, u32)) -> Planes {
 				},
 				wgpu::BindGroupEntry {
 					binding: 1,
-					resource: wgpu::BindingResource::Sampler(&converter.sampler),
+					resource: wgpu::BindingResource::Sampler(&yuv.sampler),
 				},
 				wgpu::BindGroupEntry {
 					binding: 2,
