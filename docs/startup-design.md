@@ -243,13 +243,16 @@ reported separately from client work.
    diagnosing phase costs. Break out adapter probing from the matched renderer floor.
    If that probing matters, test trying an explicitly selected backend first while
    retaining compatible fallback and the current Automatic ranking.
-2. **Reduce the first frame.** Compare upstream demand-driven emoji work with the current
-   atlas. Defer unused icon variants and media pipelines using the same foreground
-   profile, keeping the first-view layout and artwork intact. Profile the first UI pass
-   before reorganizing it. In the built-in sign-in and skeleton fixtures, assert the full
-   unused atlas is neither decoded nor queued before the first meaningful frame. Record
-   staged bytes at fixed scale. Include non-Latin first content and fractional and 2×
-   scale to check font fallback, first-use glyphs and icon sharpness.
+2. **Reduce the first frame.** Upstream #1040 owns the emoji transition from the bundled
+   atlas to demand-driven rasters. Verify sign-in and restore-shell startup on that
+   implementation and measure the first emoji view as a separate milestone. Profile
+   the first UI pass before reorganizing it. Measure the icon layers that sign-in and
+   restore actually draw, including the proposed SVG implementation in #963. Defer
+   unused icon variants and media pipelines while preserving first-view layout and
+   artwork. Record staged bytes at fixed scale. Include non-Latin first content and
+   fractional and 2× scale to check font fallback, first-use glyphs and icon sharpness.
+   [Emoji rasters](https://github.com/ViceVerse-cz/Serein/pull/1040) ·
+   [SVG icons](https://github.com/ViceVerse-cz/Serein/pull/963)
 3. **Remove avoidable waits for the session.** Overlap independent credential, route
    and device work. Prioritize the authenticated remembered-channel read and keep
    application/user selection authoritative. Change storage startup only in a measured
