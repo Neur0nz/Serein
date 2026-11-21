@@ -1081,9 +1081,12 @@ impl RolesUi {
 											.fit_to_exact_size(egui::Vec2::splat(18.0)),
 									);
 								} else if let Some(emoji) = &draft.unicode_emoji {
-									if let Some(image) = crate::emoji::image(ui.ctx(), emoji, 18.0)
-									{
-										ui.add(image);
+									if let Some(cell) = crate::emoji::lookup(emoji) {
+										let (art, _) = ui.allocate_exact_size(
+											egui::Vec2::splat(18.0),
+											egui::Sense::hover(),
+										);
+										crate::emoji::paint_unicode(ui, emoji, cell, art);
 									}
 								} else if let Some(hash) = draft
 									.icon

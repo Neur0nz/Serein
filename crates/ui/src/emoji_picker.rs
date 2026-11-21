@@ -485,12 +485,13 @@ impl Picker {
 		selected: &mut Option<String>,
 		removable: bool,
 	) {
-		let button = if let Some(image) = selected
+		let button = if let Some((emoji, cell)) = selected
 			.as_deref()
-			.and_then(|emoji| crate::emoji::image(ui.ctx(), emoji, 22.0))
+			.and_then(|emoji| crate::emoji::lookup(emoji).map(|cell| (emoji, cell)))
 		{
+			let artwork = crate::emoji::atom(ui, emoji.to_owned(), cell, 22.0);
 			ui.add(
-				egui::Button::image(image)
+				egui::Button::new(artwork)
 					.frame(false)
 					.min_size(egui::Vec2::splat(28.0)),
 			)
@@ -561,8 +562,7 @@ impl Picker {
 								for &index in self.matches.iter().skip(row * 6).take(6) {
 									let (text, _) = standard()[index];
 									let name = shortcodes()[index].as_str();
-									let image = crate::emoji::image(ui.ctx(), text, 32.0);
-									if cell(ui, image, name, true, &colors)
+									if cell(ui, None, Some(text), name, true, &colors)
 										.on_hover_text(name)
 										.clicked()
 									{
@@ -1141,7 +1141,7 @@ impl Picker {
 		let mut selected: Option<Pick> = None;
 		let mut used = None;
 		let mut gif_action: Option<GifAction> = None;
-		let mut hovered: Option<(Option<egui::Image<'static>>, String, String)> = None;
+		let mut hovered = None;
 		let mut hovered_source: Option<&str> = None;
 		let mut hovered_gif: Option<String> = None;
 		let gifs_tab = self.tab == Tab::Gifs;
@@ -1615,11 +1615,7 @@ impl Picker {
 														(Used::Unicode(index), None) => {
 															let (text, _) = standard()[index];
 															(
-																crate::emoji::image(
-																	ui.ctx(),
-																	text,
-																	32.0,
-																),
+																None,
 																text.to_owned(),
 																shortcodes()[index].clone(),
 																model::ReactionEmoji {
@@ -1637,6 +1633,10 @@ impl Picker {
 														cell(
 															ui,
 															image.clone(),
+															emoji
+																.id
+																.is_none()
+																.then_some(text.as_str()),
 															&code,
 															enabled,
 															&colors,
@@ -1659,7 +1659,12 @@ impl Picker {
 													)
 												};
 												if response.hovered() || response.has_focus() {
-													hovered = Some((image, name, code));
+													hovered = Some((
+														image,
+														name,
+														code,
+														emoji.id.is_none(),
+													));
 													hovered_source =
 														custom.map(|(g, _)| g.name.as_str());
 												}
@@ -1775,11 +1780,7 @@ impl Picker {
 																let (text, _) =
 																	standard()[standard_index];
 																(
-																	crate::emoji::image(
-																		ui.ctx(),
-																		text,
-																		32.0,
-																	),
+																	None,
 																	text.to_owned(),
 																	shortcodes()[standard_index]
 																		.clone(),
@@ -1827,6 +1828,12 @@ impl Picker {
 																		cell(
 																			ui,
 																			image.clone(),
+																			emoji
+																				.id
+																				.is_none()
+																				.then_some(
+																					text.as_str(),
+																				),
 																			&code,
 																			enabled,
 																			&colors,
@@ -1850,7 +1857,12 @@ impl Picker {
 															if response.hovered()
 																|| response.has_focus()
 															{
-																hovered = Some((image, name, code));
+																hovered = Some((
+																	image,
+																	name,
+																	code,
+																	emoji.id.is_none(),
+																));
 																hovered_source =
 																	source.map(|g| g.name.as_str());
 															}
@@ -1964,12 +1976,18 @@ impl Picker {
 									return;
 								}
 								match &hovered {
-									Some((image, fallback, code)) => {
+									Some((image, fallback, code, unicode)) => {
 										let (rect, _) = ui.allocate_exact_size(
 											egui::Vec2::splat(32.0),
 											egui::Sense::hover(),
 										);
-										paint_emoji(ui, rect, image.as_ref(), fallback);
+										if *unicode
+											&& let Some(cell) = crate::emoji::lookup(fallback)
+										{
+											crate::emoji::paint_unicode(ui, fallback, cell, rect);
+										} else {
+											paint_emoji(ui, rect, image.as_ref(), fallback);
+										}
 										ui.vertical(|ui| {
 											ui.spacing_mut().item_spacing.y = 0.0;
 											ui.add(
@@ -2707,6 +2725,7 @@ fn paint_emoji(
 fn cell(
 	ui: &mut egui::Ui,
 	image: Option<egui::Image<'static>>,
+	unicode: Option<&str>,
 	name: &str,
 	enabled: bool,
 	colors: &crate::design::Palette,
@@ -2724,6 +2743,11 @@ fn cell(
 			ui.painter().rect_filled(rect, 6, colors.hover);
 		}
 		let inner = rect.shrink(4.0);
+		let unicode = unicode.and_then(|text| crate::emoji::lookup(text).map(|cell| (text, cell)));
+		let image = image.or_else(|| {
+			let (text, cell) = unicode?;
+			crate::emoji::image(ui, text, cell, inner)
+		});
 		match image {
 			Some(image) => {
 				let image = if enabled {
@@ -2733,6 +2757,7 @@ fn cell(
 				};
 				image.paint_at(ui, inner);
 			}
+			None if unicode.is_some() => crate::emoji::paint_placeholder(ui, inner),
 			None => {
 				let short: String = name.chars().take(3).collect();
 				ui.painter().text(

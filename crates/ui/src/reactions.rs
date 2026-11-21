@@ -34,7 +34,7 @@ fn summary_name(emoji: &ReactionEmoji) -> String {
 }
 
 fn reaction_button(
-	ctx: &egui::Context,
+	ui: &egui::Ui,
 	avatars: &mut crate::avatars::Avatars,
 	emoji: &ReactionEmoji,
 	count: u32,
@@ -43,11 +43,14 @@ fn reaction_button(
 	let label = emoji.label();
 	let count = count.to_string();
 	match emoji.id {
-		None => crate::emoji::button(ctx, &label, count),
+		None => match crate::emoji::lookup(&label) {
+			Some(cell) => egui::Button::new((crate::emoji::atom(ui, label, cell, 18.0), count)),
+			None => egui::Button::new(format!("{label} {count}")),
+		},
 		Some(id) => {
 			let image = avatars
-				.custom_image(ctx, id, 18.0, demo)
-				.unwrap_or_else(|| crate::emoji::blank(ctx, 18.0));
+				.custom_image(ui.ctx(), id, 18.0, demo)
+				.unwrap_or_else(|| crate::emoji::blank(ui.ctx(), 18.0));
 			egui::Button::image_and_text(image.alt_text(label), count)
 				.image_tint_follows_text_color(false)
 		}
@@ -128,8 +131,7 @@ pub fn show(
 		}
 		for reaction in reactions {
 			let label = format!("{} {}", reaction.emoji.label(), reaction.count);
-			let button =
-				reaction_button(ui.ctx(), media.0, &reaction.emoji, reaction.count, media.1);
+			let button = reaction_button(ui, media.0, &reaction.emoji, reaction.count, media.1);
 			let response = ui.add_enabled(
 				!writing
 					&& !refreshing && reaction.emoji.name.is_some()
@@ -173,24 +175,27 @@ pub fn show(
 				.show(|ui| {
 					ui.set_width(width - 24.0);
 					ui.horizontal_centered(|ui| {
-						if let Some(image) = match reaction.emoji.id {
-							Some(id) => Some(
-								media
-									.0
-									.custom_image(ui.ctx(), id, 52.0, media.1)
-									.unwrap_or_else(|| crate::emoji::blank(ui.ctx(), 52.0)),
-							),
-							// The full-size raster matches message artwork; the atlas cell bridges it.
-							None => crate::emoji::lookup(&reaction.emoji.label())
-								.and_then(|cell| media.0.unicode_image(ui.ctx(), cell, 52.0))
-								.or_else(|| {
-									crate::emoji::image(ui.ctx(), &reaction.emoji.label(), 52.0)
-								}),
-						} {
+						let emoji = reaction.emoji.label();
+						if let Some(id) = reaction.emoji.id {
+							let image = media
+								.0
+								.custom_image(ui.ctx(), id, 52.0, media.1)
+								.unwrap_or_else(|| crate::emoji::blank(ui.ctx(), 52.0));
 							ui.add(image);
+						} else if let Some(cell) = crate::emoji::lookup(&emoji) {
+							let (art, _) = ui
+								.allocate_exact_size(egui::Vec2::splat(52.0), egui::Sense::hover());
+							if crate::emoji::artwork_is_visible(ui, art) {
+								// The scalable raster matches message artwork; the atlas bridges it.
+								if let Some(image) = media.0.unicode_image(ui.ctx(), cell, 52.0) {
+									image.paint_at(ui, art);
+								} else {
+									crate::emoji::paint_unicode(ui, &emoji, cell, art);
+								}
+							}
 						} else {
 							ui.label(
-								egui::RichText::new(reaction.emoji.label())
+								egui::RichText::new(emoji)
 									.size(26.0)
 									.color(colors.text_strong),
 							);
@@ -248,8 +253,7 @@ pub fn show_frozen(
 		ui.visuals_mut().disabled_alpha = 1.0;
 		for reaction in reactions.unwrap_or_default() {
 			let label = format!("{} {}", reaction.emoji.label(), reaction.count);
-			let button =
-				reaction_button(ui.ctx(), media.0, &reaction.emoji, reaction.count, media.1);
+			let button = reaction_button(ui, media.0, &reaction.emoji, reaction.count, media.1);
 			let response = ui.add_enabled(
 				false,
 				button
@@ -313,8 +317,12 @@ pub fn quick_button(ui: &mut egui::Ui, emoji: &str, reacted: bool) -> egui::Resp
 	} else {
 		egui::Color32::WHITE.gamma_multiply(0.4)
 	};
-	if let Some(image) = crate::emoji::image(ui.ctx(), emoji, size) {
-		image.tint(tint).paint_at(ui, target);
+	if let Some(cell) = crate::emoji::lookup(emoji) {
+		if let Some(image) = crate::emoji::image(ui, emoji, cell, target) {
+			image.tint(tint).paint_at(ui, target);
+		} else {
+			crate::emoji::paint_placeholder(ui, target);
+		}
 	} else {
 		ui.painter().text(
 			rect.center(),
@@ -390,7 +398,7 @@ pub fn show_users(
 					if ui
 						.add(
 							reaction_button(
-								ui.ctx(),
+								ui,
 								avatars,
 								&reaction.emoji,
 								reaction.count,

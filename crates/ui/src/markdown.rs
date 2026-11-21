@@ -2261,7 +2261,7 @@ impl Formatted {
 		struct Object {
 			text: String,
 			custom: Option<Id>,
-			image: Option<egui::Image<'static>>,
+			cell: Option<usize>,
 			fallback: Option<std::sync::Arc<egui::epaint::Galley>>,
 			spoiler: Option<u8>,
 		}
@@ -2294,7 +2294,7 @@ impl Formatted {
 				objects.push(Object {
 					text: label.clone(),
 					custom: None,
-					image: None,
+					cell: None,
 					fallback: None,
 					spoiler: Some(region),
 				});
@@ -2392,7 +2392,7 @@ impl Formatted {
 				objects.push(Object {
 					text: label,
 					custom: None,
-					image: None,
+					cell: None,
 					fallback: Some(galley),
 					spoiler: None,
 				});
@@ -2453,11 +2453,7 @@ impl Formatted {
 					objects.push(Object {
 						text: cluster.into(),
 						custom: custom.map(|(id, _)| id),
-						image: cell.and_then(|cell| {
-							atlas
-								.get_or_insert_with(|| crate::emoji::atlas(ui.ctx()))
-								.map(|atlas| crate::emoji::image_cell(atlas, cluster, cell, size))
-						}),
+						cell,
 						fallback,
 						spoiler: None,
 					});
@@ -2505,7 +2501,7 @@ impl Formatted {
 		let mut join_target = false;
 		for (index, cell) in layout.cells.iter().enumerate() {
 			let target = cell.rect.translate(rect.min.to_vec2());
-			if !ui.is_rect_visible(target) {
+			if !crate::emoji::artwork_is_visible(ui, target) {
 				continue;
 			}
 			let action = &actions[cell.action];
@@ -2518,14 +2514,21 @@ impl Formatted {
 						*render.revealed |= 1_u32 << region;
 					}
 				} else {
-					let image = object.custom.map_or_else(
-						|| object.image.clone(),
-						|id| render.images.custom_image(ui.ctx(), id, size, render.demo),
-					);
+					let image = match object.custom {
+						Some(id) => render.images.custom_image(ui.ctx(), id, size, render.demo),
+						None => object.cell.and_then(|cell| {
+							atlas
+								.get_or_insert_with(|| crate::emoji::visible_atlas(ui.ctx()))
+								.map(|atlas| {
+									crate::emoji::image_cell(atlas, &object.text, cell, size)
+								})
+						}),
+					};
 					artwork.push(crate::select::Artwork {
 						rect: target,
 						image: image.clone(),
 						fallback: object.fallback.clone(),
+						pending_unicode: image.is_none() && object.cell.is_some(),
 					});
 					if matches!(action, Action::Emoji) {
 						let hit = ui
@@ -2872,7 +2875,7 @@ impl Formatted {
 		}
 		// Resolve artwork only after its slot is positioned inside the viewport.
 		for (index, rect) in &slots {
-			if !ui.is_rect_visible(*rect) || !rect.intersect(ui.clip_rect()).is_positive() {
+			if !crate::emoji::artwork_is_visible(ui, *rect) {
 				continue;
 			}
 			let inline = &mut inlines[*index];
@@ -2893,7 +2896,7 @@ impl Formatted {
 								return Some(image.alt_text(&inline.text));
 							}
 							atlas
-								.get_or_insert_with(|| crate::emoji::atlas(ui.ctx()))
+								.get_or_insert_with(|| crate::emoji::visible_atlas(ui.ctx()))
 								.map(|atlas| {
 									crate::emoji::image_cell(atlas, &inline.text, cell, size)
 								})
@@ -2903,10 +2906,14 @@ impl Formatted {
 		}
 		let artwork = slots
 			.iter()
-			.map(|(index, rect)| crate::select::Artwork {
-				rect: *rect,
-				image: inlines[*index].image.clone(),
-				fallback: None,
+			.map(|(index, rect)| {
+				let inline = &inlines[*index];
+				crate::select::Artwork {
+					rect: *rect,
+					image: inline.image.clone(),
+					fallback: None,
+					pending_unicode: inline.image.is_none() && inline.cell.is_some(),
+				}
 			})
 			.collect();
 		// Labels in wrapping layouts encode preceding widgets as leading space in their first
@@ -3393,7 +3400,6 @@ impl Formatted {
 			.iter()
 			.filter(|emoji| matches!(emoji.image, PreviewImage::Emoji(_)))
 			.collect();
-		let atlas = crate::emoji::atlas(ui.ctx());
 		let mut next = 0;
 		for placed in &galley.rows {
 			for glyph in &placed.glyphs {
@@ -3412,11 +3418,8 @@ impl Formatted {
 					rect.center(),
 					egui::Vec2::splat(PREVIEW_EMOJI_SIZE),
 				);
-				if let PreviewImage::Emoji(cell) = emoji.image
-					&& let Some(atlas) = atlas
-				{
-					crate::emoji::image_cell(atlas, &emoji.text, cell, PREVIEW_EMOJI_SIZE)
-						.paint_at(ui, rect);
+				if let PreviewImage::Emoji(cell) = emoji.image {
+					crate::emoji::paint_unicode(ui, &emoji.text, cell, rect);
 				}
 				next += 1;
 			}

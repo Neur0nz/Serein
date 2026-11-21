@@ -1752,7 +1752,7 @@ impl Desktop {
 		local_store: Option<local_store::LocalStore>,
 	) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
 		ui::fonts::install(&cc.egui_ctx);
-		ui::emoji::install(&cc.egui_ctx)?;
+		ui::emoji::load_on_demand(&cc.egui_ctx);
 		ui::icons::install(&cc.egui_ctx);
 		#[cfg(feature = "demo")]
 		if demo {
