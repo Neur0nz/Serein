@@ -110,6 +110,58 @@ rendering and observed X11 pixels. Input response, physical-display timing and a
 startup remain unmeasured. Credential handling, READY identity and permission checks, and live
 history have separate prerequisites from the first window.
 
+### Release first UI pass with emoji deferred
+
+A local production-feature trace based on `6e5c6c85` leaves Twemoji unloaded during
+sign-in. This prototype isolates the remaining first-frame work. Upstream #1040 supplies
+the proposed emoji implementation. The trace uses locked Rust 1.99.1, fat LTO, offline
+Xvfb and llvmpipe Vulkan at 1×. It reports five fresh profiles and five repeat profiles
+after warmup. Every launch exited cleanly and drew sign-in in one egui pass.
+
+| Launch phase | Fresh median, ms | Repeat median, ms |
+| --- | ---: | ---: |
+| Spawn to Rust main | 65.06 | 69.15 |
+| Rust main to native setup | 15.10 | 3.64 |
+| Native window and WGPU setup | 175.38 | 112.95 |
+| Desktop constructor | 78.82 | 71.32 |
+| First frame through return from `Queue::present` | 264.36 | 62.58 |
+| Present return to observed X11 pixels | 21.16 | 18.88 |
+| Spawn to observed sign-in | 597.58 | 346.94 |
+
+Phase medians come from different launches. The first present call alone took
+188.36 ms fresh and 31.98 ms repeat on this software driver. Native setup and
+first presentation make up much of the visible delay before narrowing in on the
+app's first UI pass.
+
+| Phase | Fresh median, ms | Repeat median, ms |
+| --- | ---: | ---: |
+| Eager 64 and 32 px icon layers in constructor | 17.19 | 14.50 |
+| First app logic | 0.57 | 0.40 |
+| First app UI | 18.24 | 20.23 |
+| Visible 16 and 24 px icon layers in first app UI | 12.73 | 14.16 |
+| Text layout in first app UI | 2.78 | 3.19 |
+| Translation lookups in first app UI | 1.40 | 1.83 |
+| Native login HTTP client creation in first app UI | 0.17 | 0.16 |
+| First-frame WGPU texture staging | 34.14 | 5.02 |
+
+The spans include their children. All ten launches queued 3,715,072 bytes of CPU-side
+texture data on the first frame. The unused 64 and 32 px icon layers account for
+2,293,760 of those bytes. The visible layers still need preparation on a cold draw.
+The background system-font worker ran, and the default English first pass made zero
+system-font fallback calls. Keep the auth startup ordering and prioritize the measured
+asset work visible at 1×. Compare the separate icon branch against its session-restore
+parent, and repeat the first frame on #1040 after integration.
+[Prototype measurements](https://github.com/Neur0nz/Serein/pull/2) ·
+[Upstream emoji rasters](https://github.com/ViceVerse-cz/Serein/pull/1040)
+
+In one exploratory trace of a click on the first visible Settings gear, the event took
+142 ms to reach the handler and another 23 ms to reach the first present return. The
+Settings view itself took 5.4 ms in that frame. The first observed Settings pixels arrived
+316 ms from input. The observer cannot attribute those pixels to a particular present.
+The fixture dismissed Settings and needed forced exit after timing. Compare focus in a
+sign-in field separately from Settings so input scheduling and the cost of loading the
+full pane can be judged independently.
+
 ### What the baseline does at launch
 
 | Milestone | Work on the critical path |
