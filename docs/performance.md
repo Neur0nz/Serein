@@ -128,14 +128,17 @@ after warmup. Every launch exited cleanly and drew sign-in in one egui pass.
 | Present return to observed X11 pixels | 21.16 | 18.88 |
 | Spawn to observed sign-in | 597.58 | 346.94 |
 
-Phase medians come from different launches. The first present call alone took
-188.36 ms fresh and 31.98 ms repeat on this software driver. Native setup and
-first presentation make up much of the visible delay before narrowing in on the
-app's first UI pass.
+Phase medians come from different launches. Within native setup, WGPU instance
+creation took 95.75 ms fresh and 58.74 ms repeat. The X11 window creation call took
+1.34 ms and 1.22 ms. The first present call alone took 188.36 ms fresh and 31.98 ms
+repeat on this software driver. SQLite open took 13.52 ms fresh and 1.34 ms repeat.
+Measure WGPU backend selection, first presentation and legacy or locked stores as
+separate workloads. Their costs and required behavior differ.
 
 | Phase | Fresh median, ms | Repeat median, ms |
 | --- | ---: | ---: |
 | Eager 64 and 32 px icon layers in constructor | 17.19 | 14.50 |
+| Video converter setup in constructor | 7.42 | 4.05 |
 | First app logic | 0.57 | 0.40 |
 | First app UI | 18.24 | 20.23 |
 | Visible 16 and 24 px icon layers in first app UI | 12.73 | 14.16 |
@@ -178,6 +181,111 @@ settled images. The observer did not catch a separate parent transition at those
 All six demo launches exited cleanly. The capture checks geometry and appearance. The
 packaged tests measure startup latency separately.
 
+### Packaged comparison for icons and sign-in layout
+
+Compared the session-restore parent `5340c069` and the independent startup candidate
+`9a1e9b34`. Built both standard voice-enabled Debian packages with Rust 1.99.1 and the
+locked fat-LTO release profile. Both packages passed the 247-file smoke check. The
+experiment isolates icon-layer loading and sign-in layout from the proposed upstream
+emoji change in #1040.
+
+The Xeon Platinum 8573C runner had a four-CPU quota and 16 GiB of memory. Both builds
+used a private 1440 × 1000 × 24 Xvfb session at 1×, llvmpipe Vulkan (LLVM 19.1.7),
+private D-Bus, and disabled networking. Fresh used new no-account profiles and Mesa
+caches per launch. Repeat reused a warmed profile and Mesa cache per build. The OS
+page cache was left intact. One warmup per build and profile preceded 15 alternating
+pairs. The observer polled the native window approximately every 4 ms. All 60 measured
+launches exited cleanly.
+
+| Profile and milestone | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Fresh, mapped window | 935 (644–1,479) | 845 (639–1,216) | −128 |
+| Fresh, first sign-in pixels | 945 (658–1,497) | 854 (694–1,229) | −121 |
+| Repeat, mapped window | 519 (391–926) | 696 (396–1,580) | +119 |
+| Repeat, first sign-in pixels | 528 (397–934) | 697 (403–1,591) | +121 |
+
+The candidate reached first pixels sooner in 9 of 15 fresh pairs and 2 of 15 repeat
+pairs. A paired change is the median of same-round differences. First sign-in pixels
+can precede the first settled field positions. Use the separate stable-geometry probe
+to measure that milestone. The ranges overlap in this first batch.
+
+#### Repeat launch tail
+
+An independent block sampled 100 repeat launches per build. Five fresh Xvfb and
+D-Bus sessions each ran one warmup per build, then 20 alternating pairs. The starting
+build alternated between sessions. Both packages and the first-visible-pixels observer
+matched the initial batch. All 200 measured launches exited cleanly.
+
+| Repeat sign-in pixels | Parent, ms | Candidate, ms |
+| --- | ---: | ---: |
+| p50 | 523.92 | 498.02 |
+| Nearest-rank p95 | 820.83 | 823.19 |
+| Range | 379.60–997.08 | 363.23–1,110.71 |
+
+The paired median changed by −12.90 ms, with the candidate earlier in 54 of 100
+pairs. Session medians moved in both directions. The initial 15-pair repeat slowdown
+did not reproduce across the larger block. The larger block shows a similar tail for
+these Linux software-rendered builds. The hardware design targets require their own
+reference machine and renderer measurements.
+
+#### First stable sign-in fields
+
+A separate repeat launch probe tracked the two native sign-in fields for 500 ms
+after it first saw them. It compared their observed bounds with the final stable
+geometry at a two-pixel tolerance. A stable suffix needed at least four matching
+samples spanning 75 ms. The result timestamps the start of that suffix. The observer
+sent no input. All eight alternating pairs were usable and all 16 processes exited
+cleanly.
+
+| Repeat sign-in milestone | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Spawn to stable fields | 650 (481–986) | 465 (389–785) | −161 |
+| First fields to stable fields | 31 (23–113) | 0 (0–0) | −31 |
+
+The field bounds moved by about 35 px in each parent launch. The candidate's first
+observed fields matched their settled bounds in every launch. The candidate reached
+stable fields sooner in six of eight pairs. Both warmups needed forced cleanup.
+Excluding the first measured pair after those warmups, the geometry result held in
+all seven pairs and the paired stable-time change was −102 ms. Wall times overlap.
+A zero field shift delay means the first observed fields already matched the final
+geometry at the observer's sampling cadence.
+
+#### Click on the first visible field
+
+In the packaged candidate, a separate XTest observer clicked the center of the
+first detected empty password field within 0.35 ms of its sampling timestamp. The
+click sent no text or form submission. The fresh qualification and all five repeat
+samples showed the focus ring on the intended field. Click to focus pixels on repeat
+was 180 ms median (133–251 ms). All measured launches exited cleanly. The warmup
+needed forced cleanup after the response. The earlier prototype comparison sent its
+successful click after geometry settled, so that timestamp describes a different
+stimulus. The current probe verifies the initial hit target and measures software
+X11 response. It leaves hardware input latency and p95 unmeasured.
+
+#### Process and package resource use
+
+In five separate paired memory launches per profile, all 20 processes exited cleanly.
+The observer read Linux `smaps_rollup` at first content and one second later. RSS
+includes the software driver's process allocations.
+
+| Profile and measurement | Parent median, KiB | Candidate median, KiB | Median paired change, KiB |
+| --- | ---: | ---: | ---: |
+| Fresh RSS at first content | 276,092 | 271,604 | −4,772 |
+| Fresh RSS one second later | 284,992 | 280,784 | −4,680 |
+| Repeat RSS at first content | 263,172 | 258,000 | −5,172 |
+| Repeat RSS one second later | 272,656 | 267,560 | −5,148 |
+
+Repeat process CPU between first content and the one-second sample was 46 (42–49)
+ticks on the parent and 29 (27–32) on the candidate. A tick was 10 ms. Fresh ranges
+overlapped. The interval starts at each build's own first-content timestamp, so these
+values leave CPU before first content and sustained idle behavior unmeasured.
+
+| Package measurement | Parent, bytes | Candidate, bytes | Change, bytes |
+| --- | ---: | ---: | ---: |
+| Executable | 107,272,680 | 107,273,704 | +1,024 |
+| Installed payload | 112,000,982 | 112,002,006 | +1,024 |
+| Compressed Debian package | 57,039,360 | 57,042,440 | +3,080 |
+
 ### Minimal release renderer control on Linux
 
 Compared the packaged `afe73481` prototype with a small eframe window using the same
@@ -198,6 +306,13 @@ and a simpler first view. The package has a 107,296,232-byte executable and 17 d
 shared-library dependencies. Investigate process and native initialization before changing
 the renderer. These are local software-rendered comparisons. The gap combines binary loading,
 app setup and first-frame work. Physical GPU timing and p95 remain unmeasured.
+
+Three additional interleaved repeat pairs captured glibc 2.41 startup statistics from
+each app's own process. Median glibc startup timer counts were 0.33 million cycles
+for the control and 16.74 million for Serein. Relocation accounted for 0.13 million
+and 14.64 million cycles, respectively. These are glibc's reported timer units. They
+confirm extra linker work, and leave app-initiated library loads, native window and
+GPU setup, and attribution to individual libraries for separate measurements.
 
 ### Resident tray Show on offline X11
 
