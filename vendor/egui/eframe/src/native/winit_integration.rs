@@ -138,7 +138,9 @@ pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Contex
     egui_ctx
 }
 
-/// The custom even `eframe` uses with the [`winit`] event loop.
+pub(crate) type RepaintProxy = Arc<parking_lot::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>>;
+
+/// The custom events `eframe` uses with the [`winit`] event loop.
 #[derive(Debug)]
 pub enum UserEvent {
     /// A repaint is requested.
@@ -152,6 +154,9 @@ pub enum UserEvent {
         /// What the cumulative pass number was when the repaint was _requested_.
         cumulative_pass_nr: u64,
     },
+
+    /// An explicit activation needs a repaint of the root window without the hidden-window delay.
+    RepaintForActivation(WindowId),
 
     /// A request related to [`accesskit`](https://accesskit.dev/).
     #[cfg(feature = "accesskit")]

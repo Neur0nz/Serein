@@ -237,8 +237,7 @@ pub fn restore_window_geometry(
 	}
 }
 
-/// X11 window managers ignore maximize requests for a window that is not yet shown.
-pub fn maximize_after_show(window: &winit::window::Window) -> bool {
+pub fn is_x11_window(window: &winit::window::Window) -> bool {
 	#[cfg(target_os = "linux")]
 	{
 		use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};

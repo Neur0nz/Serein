@@ -650,8 +650,9 @@ fn main() -> eframe::Result {
 			desktop.instance = instance;
 			if let Some(geometry) = window_geometry {
 				app_settings::restore_window_geometry(&desktop.window, geometry);
+				// X11 window managers ignore maximize requests for a window that is not yet shown.
 				desktop.maximize_after_show =
-					geometry.maximized && app_settings::maximize_after_show(&desktop.window);
+					geometry.maximized && app_settings::is_x11_window(&desktop.window);
 			}
 			if start_minimized {
 				cc.egui_ctx
@@ -1158,6 +1159,8 @@ struct Desktop {
 	/// Set by the startup G-SYNC check; taken once to offer the steady refresh rate.
 	gsync: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	tray: Option<platform::tray::Tray>,
+	#[cfg(target_os = "linux")]
+	tray_activation_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 	hotkeys: platform::hotkeys::Hotkeys,
 	/// When a released push-to-talk key stops transmitting, after the release delay.
 	ptt_release: Option<std::time::Instant>,
@@ -2660,6 +2663,12 @@ impl Desktop {
 			tray_window.watch_session(&cc.egui_ctx);
 			tray_window
 		};
+		#[cfg(target_os = "linux")]
+		let tray_activation_repaint = if app_settings::is_x11_window(&window) {
+			cc.activation_repaint_callback()
+		} else {
+			None
+		};
 		#[cfg(target_os = "macos")]
 		let app_menu = {
 			let wake = cc.egui_ctx.clone();
@@ -2764,6 +2773,8 @@ impl Desktop {
 			startup,
 			gsync,
 			tray: None,
+			#[cfg(target_os = "linux")]
+			tray_activation_repaint,
 			tray_window,
 			#[cfg(target_os = "macos")]
 			app_menu,
@@ -3256,6 +3267,7 @@ impl Desktop {
 				platform::tray::Tray::new(
 					move || wake.request_repaint(),
 					self.tray_window.restorer(),
+					self.tray_activation_repaint.clone(),
 				)
 			};
 			#[cfg(not(target_os = "linux"))]

@@ -36,7 +36,7 @@ use log::warn;
 
 use super::{
     epi_integration, event_loop_context,
-    winit_integration::{EventResult, PassMode, UserEvent, WinitApp, create_egui_context},
+    winit_integration::{EventResult, PassMode, RepaintProxy, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
 use crate::{
@@ -48,7 +48,7 @@ use crate::{
 // Types:
 
 pub struct GlowWinitApp<'app> {
-    repaint_proxy: Arc<egui::mutex::Mutex<EventLoopProxy<UserEvent>>>,
+    repaint_proxy: RepaintProxy,
     app_name: String,
     native_options: NativeOptions,
     running: Option<GlowWinitRunning<'app>>,
@@ -252,7 +252,7 @@ impl<'app> GlowWinitApp<'app> {
     ) -> Self {
         profiling::function_scope!();
         Self {
-            repaint_proxy: Arc::new(egui::mutex::Mutex::new(event_loop.create_proxy())),
+            repaint_proxy: Arc::new(parking_lot::Mutex::new(event_loop.create_proxy())),
             app_name: app_name.to_owned(),
             native_options,
             running: None,
@@ -442,6 +442,7 @@ impl<'app> GlowWinitApp<'app> {
                 #[cfg(feature = "wgpu_no_default_features")]
                 wgpu_render_state: None,
                 window: Some(Arc::clone(&window)),
+                repaint_proxy: Some(&self.repaint_proxy),
                 raw_display_handle: window.display_handle().map(|h| h.as_raw()),
                 raw_window_handle: window.window_handle().map(|h| h.as_raw()),
                 embedded_views: integration.frame.embedded_views().clone(),

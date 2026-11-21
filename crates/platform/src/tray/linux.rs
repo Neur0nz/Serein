@@ -16,6 +16,7 @@ struct Events {
 	availability: AtomicU8,
 	wake: Box<dyn Fn() + Send + Sync>,
 	restore: Box<dyn Fn() + Send + Sync>,
+	activation_repaint: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Events {
@@ -28,7 +29,13 @@ impl Events {
 			(self.restore)();
 		}
 		if self.bits.fetch_or(event as u8, Ordering::Relaxed) & event as u8 == 0 {
-			(self.wake)();
+			if event == Event::Show
+				&& let Some(activation_repaint) = &self.activation_repaint
+			{
+				activation_repaint();
+			} else {
+				(self.wake)();
+			}
 		}
 	}
 }
@@ -42,9 +49,11 @@ pub struct Tray {
 
 impl Tray {
 	/// `restore` runs on the tray worker for events that need a visible window, before `wake`.
+	/// `activation_repaint`, if supplied, replaces the ordinary wake for a newly queued Show.
 	pub fn new(
 		wake: impl Fn() + Send + Sync + 'static,
 		restore: impl Fn() + Send + Sync + 'static,
+		activation_repaint: Option<Arc<dyn Fn() + Send + Sync>>,
 	) -> Result<Self, &'static str> {
 		let runtime = tokio::runtime::Handle::try_current()
 			.map_err(|_| "The tray requires the application runtime.")?;
@@ -53,6 +62,7 @@ impl Tray {
 			availability: AtomicU8::new(0),
 			wake: Box::new(wake),
 			restore: Box::new(restore),
+			activation_repaint,
 		});
 		let (stop, mut stopped) = oneshot::channel();
 		let (menu, mut menus) = watch::channel(MenuState::default());

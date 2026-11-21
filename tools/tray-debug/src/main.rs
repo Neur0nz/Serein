@@ -32,7 +32,7 @@ mod linux {
 	use std::{
 		sync::{
 			Arc,
-			atomic::{AtomicBool, Ordering},
+			atomic::{AtomicBool, AtomicUsize, Ordering},
 		},
 		time::Duration,
 	};
@@ -79,9 +79,20 @@ mod linux {
 			"Use dbus-run-session; never replace a real desktop watcher."
 		);
 		let wake = Arc::new(Notify::new());
+		let activations = Arc::new(AtomicUsize::new(0));
 		let start = || {
 			let wake = wake.clone();
-			Tray::new(move || wake.notify_one(), || {}).unwrap()
+			let activation_wake = wake.clone();
+			let activations = activations.clone();
+			Tray::new(
+				move || wake.notify_one(),
+				|| {},
+				Some(Arc::new(move || {
+					activations.fetch_add(1, Ordering::Relaxed);
+					activation_wake.notify_one();
+				})),
+			)
+			.unwrap()
 		};
 		let missing = start();
 		event(&missing, &wake, Event::Unavailable).await;
@@ -135,6 +146,7 @@ mod linux {
 		}
 		event(&tray, &wake, Event::Show).await;
 		assert_eq!(tray.take_event(), None, "Show events must coalesce");
+		assert_eq!(activations.load(Ordering::Relaxed), 1, "one Show wake");
 		println!("PASS: icon and coalesced activation");
 		let menu_path: zbus::zvariant::OwnedObjectPath = item.get_property("Menu").await?;
 		let menu =
@@ -160,6 +172,7 @@ mod linux {
 		host.release_name("org.kde.StatusNotifierWatcher").await?;
 		event(&tray, &wake, Event::Unavailable).await;
 		assert!(!tray.is_available());
+		assert_eq!(activations.load(Ordering::Relaxed), 2, "only Show wakes");
 		drop(tray);
 		println!("PASS: host loss");
 		while dbus.name_has_owner(service.as_str().try_into()?).await? {

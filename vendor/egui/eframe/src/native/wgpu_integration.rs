@@ -41,7 +41,7 @@ use super::{epi_integration, event_loop_context, winit_integration, winit_integr
 // Types:
 
 pub struct WgpuWinitApp<'app> {
-    repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
+    repaint_proxy: winit_integration::RepaintProxy,
     app_name: String,
     native_options: NativeOptions,
 
@@ -352,6 +352,7 @@ impl<'app> WgpuWinitApp<'app> {
             get_proc_address: None,
             wgpu_render_state,
             window: Some(Arc::clone(&window)),
+            repaint_proxy: Some(&self.repaint_proxy),
             raw_display_handle: window.display_handle().map(|h| h.as_raw()),
             raw_window_handle: window.window_handle().map(|h| h.as_raw()),
             embedded_views: integration.frame.embedded_views().clone(),
