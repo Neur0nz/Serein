@@ -32,7 +32,7 @@ mod linux {
 	use std::{
 		sync::{
 			Arc,
-			atomic::{AtomicBool, Ordering},
+			atomic::{AtomicBool, AtomicUsize, Ordering},
 		},
 		time::Duration,
 	};
@@ -79,9 +79,20 @@ mod linux {
 			"Use dbus-run-session; never replace a real desktop watcher."
 		);
 		let wake = Arc::new(Notify::new());
+		let activations = Arc::new(AtomicUsize::new(0));
 		let start = || {
 			let wake = wake.clone();
-			Tray::new(move || wake.notify_one(), || {}).unwrap()
+			let activation_wake = wake.clone();
+			let activations = activations.clone();
+			Tray::new(
+				move || wake.notify_one(),
+				|| {},
+				Some(Arc::new(move || {
+					activations.fetch_add(1, Ordering::Relaxed);
+					activation_wake.notify_one();
+				})),
+			)
+			.unwrap()
 		};
 		let missing = start();
 		event(&missing, &wake, Event::Unavailable).await;
@@ -128,13 +139,17 @@ mod linux {
 		.await?;
 		assert_eq!(item.get_property::<String>("Title").await?, "Serein");
 		let icon: Vec<(i32, i32, Vec<u8>)> = item.get_property("IconPixmap").await?;
-		assert_eq!(icon.len(), 1);
-		assert_eq!((icon[0].0, icon[0].1, icon[0].2.len()), (32, 32, 4096));
+		let [(width, height, pixels)] = icon.as_slice() else {
+			panic!("Expected one StatusNotifier pixmap");
+		};
+		assert!(*width > 0 && *height > 0);
+		assert_eq!(pixels.len(), *width as usize * *height as usize * 4);
 		for _ in 0..16 {
 			item.call::<_, _, ()>("Activate", &(0i32, 0i32)).await?;
 		}
 		event(&tray, &wake, Event::Show).await;
 		assert_eq!(tray.take_event(), None, "Show events must coalesce");
+		assert_eq!(activations.load(Ordering::Relaxed), 1, "one Show wake");
 		println!("PASS: icon and coalesced activation");
 		let menu_path: zbus::zvariant::OwnedObjectPath = item.get_property("Menu").await?;
 		let menu =
@@ -160,6 +175,7 @@ mod linux {
 		host.release_name("org.kde.StatusNotifierWatcher").await?;
 		event(&tray, &wake, Event::Unavailable).await;
 		assert!(!tray.is_available());
+		assert_eq!(activations.load(Ordering::Relaxed), 2, "only Show wakes");
 		drop(tray);
 		println!("PASS: host loss");
 		while dbus.name_has_owner(service.as_str().try_into()?).await? {

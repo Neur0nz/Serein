@@ -90,6 +90,12 @@ pub struct CreationContext<'s> {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) window: Option<std::sync::Arc<winit::window::Window>>,
 
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "glow", feature = "wgpu_no_default_features")
+    ))]
+    pub(crate) repaint_proxy: Option<&'s crate::native::winit_integration::RepaintProxy>,
+
     /// Raw platform window handle
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) raw_window_handle: Result<RawWindowHandle, HandleError>,
@@ -104,6 +110,24 @@ impl CreationContext<'_> {
     /// placed the views that the platform draws, such as web views.
     pub fn embedded_views(&self) -> &crate::EmbeddedViews {
         &self.embedded_views
+    }
+
+    /// A thread-safe repaint request for explicit activation of the root window.
+    ///
+    /// This wakes the event loop even when the root is hidden and ordinary repaints
+    /// are throttled. The app handles the activation in its usual event processing.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "glow", feature = "wgpu_no_default_features")
+    ))]
+    pub fn activation_repaint_callback(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        let window_id = self.window.as_ref()?.id();
+        let proxy = std::sync::Arc::clone(self.repaint_proxy?);
+        Some(std::sync::Arc::new(move || {
+            let _ = proxy
+                .lock()
+                .send_event(UserEvent::RepaintForActivation(window_id));
+        }))
     }
 }
 
@@ -141,6 +165,11 @@ impl CreationContext<'_> {
             wgpu_render_state: None,
             #[cfg(not(target_arch = "wasm32"))]
             window: None,
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                any(feature = "glow", feature = "wgpu_no_default_features")
+            ))]
+            repaint_proxy: None,
             #[cfg(not(target_arch = "wasm32"))]
             raw_window_handle: Err(HandleError::NotSupported),
             #[cfg(not(target_arch = "wasm32"))]

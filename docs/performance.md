@@ -335,6 +335,62 @@ path. Measure a dedicated wake from the tray event to main-loop logic while pres
 background throttling. Cold tray, panel focus, scanout and p95 are separate measurements.
 [Tray lifecycle design](startup-design.md#tray-lifecycle-and-failure-handling)
 
+#### Immediate X11 tray activation
+
+The candidate routes a coalesced Show through the native event loop for immediate
+processing. Ordinary hidden-window repaint requests still use the 100 ms delay.
+The comparison uses the exact packaged runtime from the parent branch (`9a1e9b34`)
+and the candidate (`47af0a19`). Both are standard voice-enabled Debian packages.
+On the same offline Debian 13 VM (Xeon Platinum 8573C, 4 vCPU quota, 16 GiB RAM),
+the observer runs signed-out X11 on Xvfb at 1440×1000 and scale 1 with llvmpipe
+Vulkan. It dispatches Show through a private StatusNotifier host and polls X11
+every 4 ms. The alternated trials use separate warmed profiles and one warmup
+per build. The short and long cohorts wait 350 ms and 4 s after X11 reports the
+window unviewable, respectively.
+
+| After a 350 ms hide | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Show to X11 remap | 113.6 (110.6–135.9) | 12.2 (10.9–69.9) | −101.4 |
+| Show to varied sign-in pixels | 137.5 (133.4–159.2) | 36.8 (32.1–96.7) | −100.8 |
+| Process CPU during the hidden interval | 95 (80–170) | 90 (80–130) | 0 |
+
+Both Show milestones improved in all 12 pairs. X11 can display retained content
+on remap. The visible-pixel measure describes what the observer sees. Fresh
+WGPU presentation, desktop-panel focus and hardware p95 need separate tests.
+
+| After a four-second hide, three pairs | Parent median (range) | Candidate median (range) | Median paired change |
+| --- | ---: | ---: | ---: |
+| Show to X11 remap, ms | 148.9 (120.8–150.3) | 54.7 (29.8–59.8) | −95.6 |
+| Show to varied sign-in pixels, ms | 166.3 (147.7–179.9) | 96.4 (68.5–106.4) | −83.5 |
+| Process CPU during the hidden interval, ms | 110 (100–150) | 120 (100–190) | +10 |
+| Process RSS before Show, KiB | 268,952 (266,476–269,028) | 267,600 (267,184–267,764) | −1,188 |
+| Process PSS before Show, KiB | 240,516 (237,989–240,529) | 239,164 (238,732–239,284) | −1,245 |
+
+The long-hide cohort reads `/proc/<pid>/smaps_rollup` immediately before Show.
+PSS apportions shared resident pages to Serein. The readings cover the Serein
+process. Xvfb, D-Bus, and dedicated GPU memory require separate measurements.
+Hidden CPU uses 10 ms process ticks and includes tail work from closing the
+window. The overlap and small sample leave the differences in hidden CPU and
+memory inconclusive.
+
+A separate interaction trial clicked Settings after Show and verified the new
+navigation in the app and X11 screen. The observer dismissed Settings, closed
+the window, and sent Show as soon as X11 confirmed the unmap. Both builds
+kept the same process and window, opened Settings again, and quit through
+the tray. The initial rapid remap was 31.0 ms on the parent and 92.8 ms on the
+candidate. A fresh block of 12 rapid pairs passed all interaction checks and
+had a median paired remap change of +0.4 ms with a range of −11.3 to +9.9 ms.
+Median time to pixels was 41.6 ms on the parent and 40.8 ms on the candidate,
+with ranges of 38.6–55.2 ms and 38.2–82.0 ms. The repeat block places the
+median difference within the 4 ms polling interval. Its slower candidate
+samples leave the rapid-reopen tail unresolved.
+
+| Standard Debian build | Parent | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Executable bytes | 107,273,704 | 107,277,672 | +3,968 |
+| Full package installed size, KiB | 109,581 | 109,585 | +4 |
+| Compressed package bytes | 57,042,440 | 57,033,308 | −9,132 |
+
 ### What the baseline does at launch
 
 | Milestone | Work on the critical path |

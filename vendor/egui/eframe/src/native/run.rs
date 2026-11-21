@@ -348,6 +348,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         profiling::function_scope!(match &event {
             UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
+            UserEvent::RepaintForActivation(_) => "UserEvent::RepaintForActivation",
             #[cfg(feature = "accesskit")]
             UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
         });
@@ -387,6 +388,15 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                     } else {
                         log::trace!("Got outdated UserEvent::RequestRepaint");
                         Ok(EventResult::Wait) // old request - we've already repainted
+                    }
+                }
+                UserEvent::RepaintForActivation(window_id) => {
+                    if self.winit_app.window_id_from_viewport_id(egui::ViewportId::ROOT)
+                        == Some(window_id)
+                    {
+                        Ok(EventResult::RepaintAt(window_id, Instant::now()))
+                    } else {
+                        Ok(EventResult::Wait)
                     }
                 }
                 #[cfg(feature = "accesskit")]
