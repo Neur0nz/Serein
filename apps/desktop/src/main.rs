@@ -1225,6 +1225,10 @@ struct Desktop {
 	/// Session generation whose account was last recorded in the switcher roster.
 	roster_generation: Option<u64>,
 	close_approved: bool,
+	/// Tier-1 silent close drain deadline when only fast optimistic / cache writes remain.
+	closing_drain: Option<ClosingDrain>,
+	/// Set when a background write fails during silent close drain, falling back to confirm modal.
+	closing_drain_failed: bool,
 	#[cfg(feature = "demo")]
 	startup_demo: bool,
 	restoring_saved_login: bool,
@@ -1241,6 +1245,12 @@ struct Desktop {
 	#[cfg(feature = "demo")]
 	synthetic_id: u64,
 	token_input: Zeroizing<String>,
+}
+#[derive(Clone, Copy)]
+struct ClosingDrain {
+	deadline: Instant,
+	generation: u64,
+	background_failures: Option<u64>,
 }
 /// Why a connection ended. Fixed labels, flags and redacted details only, so the diagnostics
 /// report can show it whether or not logging was on.
@@ -2803,6 +2813,8 @@ impl Desktop {
 			roster_failed: false,
 			roster_generation: None,
 			close_approved: false,
+			closing_drain: None,
+			closing_drain_failed: false,
 			#[cfg(feature = "demo")]
 			startup_demo: demo && std::env::args().any(|arg| arg == "--demo-restoring"),
 			restoring_saved_login: false,
@@ -3878,6 +3890,9 @@ impl Desktop {
 	/// Dispatches one queued command to the demo or live transport.
 	fn show_action_errors(&mut self) {
 		for error in self.state.take_action_errors() {
+			if self.closing_drain.is_some() {
+				self.closing_drain_failed = true;
+			}
 			self.messaging.toasts.push_write_error(error);
 		}
 	}
@@ -4978,8 +4993,8 @@ impl Desktop {
 			return;
 		}
 		if let Some(connection) = &self.connection {
-			if let Err(error) = connection.commands.try_send(command) {
-				self.state.command_rejected(error.into_inner());
+			if let Some(command) = connection.submit(command) {
+				self.state.command_rejected(command);
 			}
 		} else {
 			self.state.command_rejected(command);
@@ -7042,39 +7057,80 @@ impl eframe::App for Desktop {
 		for command in self.state.take_follow_up_commands() {
 			self.command(command);
 		}
+		let heavy_close_guard = (self.state.demo && self.state.has_unsent())
+			|| self
+				.state
+				.pending
+				.iter()
+				.any(|p| p.delivery != Delivery::Confirmed)
+			|| self.messaging.has_edit()
+			|| self.messaging.has_server_settings_changes()
+			|| self.messaging.extensions.theme_editor_dirty()
+			|| self.state.server_settings.pending
+			|| self.state.server_admin.pending
+			|| self.state.server_action_pending()
+			|| self.state.administrative_channel_write_pending()
+			|| self.state.group_action_pending()
+			|| self.state.dm_open_pending()
+			|| self.state.group_create_pending()
+			|| self.state.polls.pending.is_some()
+			|| self.state.account_challenge().is_some()
+			|| self.uploads.has_unsent()
+			|| self.messaging.external_upload.has_unsent()
+			|| self.forgetting
+			|| self.messaging.startup_busy
+			|| self.avatar_cleanup.is_some()
+			|| self.cache_clears.pending()
+			|| (!self.fixture_only && self.app_settings.state.needs_attention())
+			|| (!self.fixture_only && self.reading.needs_attention())
+			|| (!self.fixture_only && self.game_activity.needs_attention())
+			|| (!self.fixture_only && self.tray_setting.needs_attention())
+			|| self.cache_error;
 		if close_requested && !self.close_approved && !self.tray_window.system_close() {
 			self.sync_startup_selection(&ctx, true);
 		}
-		if close_requested
-			&& !self.close_approved
-			&& !self.tray_window.system_close()
-			&& ((self.state.demo && self.state.has_unsent())
-				|| self
-					.state
-					.pending
-					.iter()
-					.any(|p| p.delivery != Delivery::Confirmed)
-				|| self.messaging.has_edit()
-				|| self.messaging.has_server_settings_changes()
-				|| self.messaging.extensions.theme_editor_dirty()
-				|| self.state.server_settings.pending
-				|| self.state.server_admin.pending
-				|| self.state.has_fast_pending_writes()
-				|| self.uploads.has_unsent()
-				|| self.messaging.external_upload.has_unsent()
-				|| self.forgetting
-				|| self.messaging.startup_busy
-				|| self.avatar_cleanup.is_some()
-				|| self.cache_pending > 0
-				|| self.cache_clears.pending()
-				|| (!self.fixture_only && self.app_settings.state.needs_attention())
-				|| (!self.fixture_only && self.reading.needs_attention())
-				|| (!self.fixture_only && self.game_activity.needs_attention())
-				|| (!self.fixture_only && self.tray_setting.needs_attention())
-				|| self.cache_error)
-		{
-			ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-			self.confirming_close = true;
+		let background = self
+			.connection
+			.as_ref()
+			.map(connection::Connection::background_write_status);
+		let fast_close_work = self.state.has_fast_pending_writes()
+			|| self.cache_pending > 0
+			|| background.is_some_and(|(outstanding, _)| outstanding > 0);
+		if close_requested && !self.close_approved && !self.tray_window.system_close() {
+			if heavy_close_guard {
+				ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.confirming_close = true;
+			} else if fast_close_work {
+				ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+				self.closing_drain.get_or_insert_with(|| ClosingDrain {
+					deadline: Instant::now() + Duration::from_millis(1500),
+					generation: self.state.generation,
+					background_failures: background.map(|(_, failures)| failures),
+				});
+				ctx.request_repaint();
+			}
+		}
+		if let Some(drain) = self.closing_drain {
+			let failed = self.closing_drain_failed
+				|| drain.generation != self.state.generation
+				|| drain.background_failures.is_some_and(|initial| {
+					background.is_none_or(|(_, failures)| failures != initial)
+				});
+			if !heavy_close_guard && !failed && !fast_close_work {
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.close_approved = true;
+				ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+			} else if heavy_close_guard || failed || Instant::now() >= drain.deadline {
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.confirming_close = true;
+			} else {
+				let remaining = drain.deadline.saturating_duration_since(Instant::now());
+				ctx.request_repaint_after(remaining.min(Duration::from_millis(50)));
+			}
 		}
 		// The window size the interface layout shown this frame asks for.
 		let mut interface_size = None;
