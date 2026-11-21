@@ -238,6 +238,8 @@ davey = { path = "vendor/davey" }
 wry = { path = "vendor/wry" }
 # Wayland image paste reads `image/png` through the focused surface; see vendor/smithay-clipboard/SEREIN-PATCH.md.
 smithay-clipboard = { path = "vendor/smithay-clipboard" }
+# Wake X11 hotkey registration immediately; see vendor/global-hotkey/SEREIN-PATCH.md.
+global-hotkey = { path = "vendor/global-hotkey" }
 
 # The wreq revision wreq-util's Chromium profiles are built against (its main branch has since
 # renamed TLS and HTTP/2 options), with the BoringSSL that wreq-util pins: the TLS options
