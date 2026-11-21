@@ -636,6 +636,18 @@ can differ in when X11 maps the window and when the first presented pixels
 arrive. Instrument those events to locate the fresh-cache delay before treating
 the candidate as a launch improvement.
 
+A fourth session kept the fixed dark theme and fresh application profiles.
+One clean launch of each build seeded a shared Mesa cache. Every measured
+launch used its own copy of that same seed, and the 101-file seed passed hash
+verification afterward. All 12 alternating pairs exited cleanly and the
+sampled dark crops matched. The map-to-pixels medians were 38.3 ms for the
+parent and 54.0 ms for the candidate. The median paired increase was 14.2 ms
+(−16.2 to +165.0 ms), with the candidate later in ten pairs. Spawn-to-pixels
+medians were 472.0 and 398.1 ms, respectively. The paired median changed by
+−56.4 ms (−266.9 to +276.9 ms), with six runs earlier and six later. The
+post-map difference persisted with a smaller median when both builds reused
+the same driver cache. Its cause remains unresolved.
+
 Separate memory runs used eight pairs per profile with the default desktop
 theme and eight per profile with the fixed dark theme. The observer read
 process PSS at first sign-in pixels and one second later. All processes exited
