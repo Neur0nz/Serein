@@ -74,7 +74,10 @@ use client_core::{
 };
 use eframe::egui;
 use model::Delivery;
-use std::{sync::Arc, time::Duration};
+use std::{
+	sync::Arc,
+	time::{Duration, Instant},
+};
 use zeroize::Zeroizing;
 
 /// Run explicit offline checks before native startup, or launch the configured desktop client.
@@ -1214,7 +1217,7 @@ struct Desktop {
 	confirming_logout: bool,
 	/// What the pending session teardown is for: logging out, switching or adding an account.
 	end_intent: SessionEnd,
-	/// Saved account whose token is being read for a switch.
+	/// Expected account while restoring a login for an explicit switch.
 	switching: Option<model::Id>,
 	/// A switcher-roster write is in flight; failures stop retrying for this session.
 	roster_pending: bool,
@@ -1222,6 +1225,13 @@ struct Desktop {
 	/// Session generation whose account was last recorded in the switcher roster.
 	roster_generation: Option<u64>,
 	close_approved: bool,
+	#[cfg(feature = "demo")]
+	startup_demo: bool,
+	restoring_saved_login: bool,
+	startup_selection_loading: bool,
+	startup_selection_saved_at: Option<Instant>,
+	startup_selection_saved: Option<model::Id>,
+	startup_selection_saving: Option<model::Id>,
 	fixture_only: bool,
 	/// Sign-in screen disclosures, folded away until the owner opens them.
 	about_open: bool,
@@ -1453,6 +1463,23 @@ fn hydrate_cache_result(state: &mut State, safety: &cache::HistorySafety, outcom
 	{
 		hydrate_cached_history(state, channel, request, messages, start);
 	}
+}
+
+fn startup_selection(state: &State, account: model::Id, channel: model::Id) -> Option<model::Id> {
+	(state.auth == AuthState::Authenticated
+		&& state.gateway_connected
+		&& state.user.as_ref().is_some_and(|user| user.id == account)
+		&& state.selected.is_none()
+		&& state.trail.is_empty()
+		&& state.channel(channel).is_some_and(|target| {
+			client_core::navigable(target)
+				&& if target.supports_text() {
+					state.can_read_history(channel)
+				} else {
+					state.can_view(channel)
+				}
+		}))
+	.then_some(channel)
 }
 
 fn recovery_draft(state: &State, channel: model::Id) -> String {
@@ -2782,6 +2809,13 @@ impl Desktop {
 			roster_failed: false,
 			roster_generation: None,
 			close_approved: false,
+			#[cfg(feature = "demo")]
+			startup_demo: demo && std::env::args().any(|arg| arg == "--demo-restoring"),
+			restoring_saved_login: false,
+			startup_selection_loading: false,
+			startup_selection_saved_at: None,
+			startup_selection_saved: None,
+			startup_selection_saving: None,
 			fixture_only: demo,
 			about_open: sign_in_panels,
 			token_open: sign_in_panels,
@@ -2815,6 +2849,8 @@ impl Desktop {
 				cache::Operation::LoadChannel { .. }
 					| cache::Operation::SaveChannel { .. }
 					| cache::Operation::SaveChanges { .. }
+					| cache::Operation::LoadStartupSelection
+					| cache::Operation::SaveStartupSelection(_)
 			) && !cache.history.allows(cache.history.epoch())
 			{
 				return false;
@@ -3788,6 +3824,40 @@ impl Desktop {
 			_ => return,
 		};
 		self.delete_cached_ids(channel, ids);
+	}
+	fn sync_startup_selection(&mut self, ctx: &egui::Context, force: bool) {
+		if self.fixture_only
+			|| self.state.demo
+			|| self.cache_error
+			|| self.state.auth != AuthState::Authenticated
+		{
+			return;
+		}
+		let Some(channel) = self.state.selected else {
+			return;
+		};
+		if self
+			.startup_selection_saving
+			.or(self.startup_selection_saved)
+			== Some(channel)
+		{
+			return;
+		}
+		if !force {
+			if self.startup_selection_saving.is_some() {
+				return;
+			}
+			if let Some(at) = self.startup_selection_saved_at {
+				let remaining = Duration::from_secs(30).saturating_sub(at.elapsed());
+				if !remaining.is_zero() {
+					ctx.request_repaint_after(remaining);
+					return;
+				}
+			}
+		}
+		if self.queue_cache(cache::Operation::SaveStartupSelection(channel)) {
+			self.startup_selection_saving = Some(channel);
+		}
 	}
 	fn delete_cached_ids(&mut self, channel: model::Id, ids: Vec<model::Id>) {
 		if self.state.demo || self.fixture_only || ids.is_empty() {
@@ -5259,6 +5329,50 @@ impl Desktop {
 				continue;
 			}
 			match outcome {
+				cache::Outcome::StartupSelection {
+					account,
+					channel,
+					epoch,
+				} => {
+					self.restoring_saved_login = false;
+					self.startup_selection_loading = false;
+					if self.cache.as_ref().is_some_and(|c| c.history.allows(epoch))
+						&& self
+							.state
+							.user
+							.as_ref()
+							.is_some_and(|user| user.id == account)
+					{
+						self.startup_selection_saved = channel;
+						if let Some(channel) =
+							channel.and_then(|id| startup_selection(&self.state, account, id))
+							&& let Some(command) = self.state.select(channel)
+						{
+							self.command(command);
+						}
+					}
+				}
+				cache::Outcome::StartupSelectionSaved {
+					channel,
+					result,
+					epoch,
+				} => {
+					if self.startup_selection_saving == Some(channel) {
+						self.startup_selection_saving = None;
+					}
+					if let Some(result) = result {
+						if result.is_err() {
+							self.cache_error = true;
+							self.cache_status = "Could not save the last conversation";
+						} else if self.cache.as_ref().is_some_and(|c| c.history.allows(epoch)) {
+							self.startup_selection_saved = Some(channel);
+							self.startup_selection_saved_at = Some(Instant::now());
+							if !self.cache_error {
+								self.cache_status = "Local changes saved";
+							}
+						}
+					}
+				}
 				cache::Outcome::ChannelPreferences(result) => {
 					self.messaging.channel_preferences_load_pending = false;
 					self.messaging.channel_preferences_reload = false;
@@ -5359,8 +5473,11 @@ impl Desktop {
 						// `connect()` already sets a "Connecting to Discord…" status; avoid
 						// stacking a second, near-duplicate line under the restore screen.
 						self.credential_status = "";
+						self.switching = switching;
+						self.restoring_saved_login = true;
 						self.connect(secret, switching.is_some(), ctx);
 					} else {
+						self.restoring_saved_login = false;
 						self.credential_status = credentials::loaded_status(&result);
 						if let Some(account) = switching {
 							// The entry stays: the owner decides whether to forget it. Signing
@@ -5662,6 +5779,15 @@ impl Desktop {
 				self.queue_cache(cache::Operation::SaveDraft { channel, content });
 			}
 			if ready && self.state.auth == AuthState::Authenticated {
+				self.switching = None;
+				// The authenticated account in READY is authoritative; roster order is unrelated.
+				if self.restoring_saved_login && !self.startup_selection_loading {
+					self.startup_selection_loading = self.state.selected.is_none()
+						&& self.state.trail.is_empty()
+						&& self.queue_cache(cache::Operation::LoadStartupSelection);
+					// A token refresh may replace this generation before its load completes.
+					self.restoring_saved_login = self.startup_selection_loading;
+				}
 				// The worker survives logout; each accepted account READY restores its own drafts.
 				if !self.messaging.draft_restore_pending {
 					self.messaging.draft_restore_pending =
@@ -5792,6 +5918,7 @@ impl Desktop {
 			self.connection = None;
 			self.pending_save = None;
 			self.pending_account_save = None;
+			self.clear_startup_restore();
 			self.voice.stop();
 			self.messaging.camera_test_requested = false;
 			self.messaging.camera_test_texture = None;
@@ -5856,11 +5983,13 @@ impl Desktop {
 			self.connect(secret, true, ctx);
 		}
 		if let Some(secret) = self.native.poll(ctx) {
+			self.clear_startup_restore();
 			self.connect(secret, true, ctx);
 		}
 		if let Some(login) = &self.login {
 			login.pump();
 			if let Some(secret) = login.token() {
+				self.clear_startup_restore();
 				self.connect(secret, true, ctx);
 			} else if login.expired() {
 				let crashed = login.crashed();
@@ -6866,6 +6995,9 @@ impl eframe::App for Desktop {
 			self.messaging.accept_server_sticker(&ctx, scope, result);
 		}
 		self.messaging.voice_available = true;
+		if close_requested && !self.close_approved && !self.tray_window.system_close() {
+			self.sync_startup_selection(&ctx, true);
+		}
 		if close_requested
 			&& !self.close_approved
 			&& !self.tray_window.system_close()
@@ -6982,6 +7114,8 @@ impl eframe::App for Desktop {
 			if let Some(login) = &self.login {
 				login.resize(&self.window);
 			}
+		} else if let Some(stage) = self.restoring() {
+			self.restoring_screen(ui, &stage);
 		} else if self.state.user.is_some() {
 			self.messaging.storage_status = self.cache_status;
 			self.messaging.notification_status = self.notifications.status().label();
@@ -7443,6 +7577,8 @@ impl eframe::App for Desktop {
 			}
 			if self.messaging.clear_cache_requested {
 				self.messaging.clear_cache_requested = false;
+				// Keep the open conversation in RAM without immediately saving its selection again.
+				self.startup_selection_saved = self.state.selected;
 				self.state.clear_cached_history();
 				self.clear_avatars(&ctx);
 				self.queue_cache(cache::Operation::ClearHistory);
@@ -7465,12 +7601,11 @@ impl eframe::App for Desktop {
 			}
 			// A click that adopted a hover preload sends no request of its own.
 			self.load_cached_history();
+			self.sync_startup_selection(&ctx, false);
 			if self.messaging.logout_requested {
 				self.messaging.logout_requested = false;
 				self.request_session_end(&ctx, SessionEnd::Logout);
 			}
-		} else if let Some(stage) = self.restoring() {
-			self.restoring_screen(ui, &stage);
 		} else {
 			self.sign_in_screen(ui);
 		}
@@ -8055,6 +8190,27 @@ mod tests {
 			false,
 		);
 		assert!(state.timeline.is_empty());
+	}
+	#[test]
+	fn saved_startup_selection_requires_the_ready_account_and_current_access() {
+		let mut state = test_support::demo_state();
+		let channel = state.selected.take().unwrap();
+		let account = state.user.as_ref().unwrap().id;
+		state.trail = client_core::Trail::default();
+		assert_eq!(startup_selection(&state, account, channel), Some(channel));
+		assert_eq!(startup_selection(&state, model::Id(999), channel), None);
+
+		state.auth = AuthState::Authenticating;
+		assert_eq!(startup_selection(&state, account, channel), None);
+		state.auth = AuthState::Authenticated;
+		let permissions = state.permissions.clone();
+		state.permissions.channels.remove(&channel);
+		state.permissions.clear_cache();
+		assert_eq!(startup_selection(&state, account, channel), None);
+
+		state.permissions = permissions;
+		state.open_home();
+		assert_eq!(startup_selection(&state, account, channel), None);
 	}
 	#[test]
 	fn attachment_sends_stay_allowed_while_the_latest_page_reloads() {

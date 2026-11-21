@@ -50,6 +50,7 @@ mod new_message;
 pub mod proxy_auth;
 mod rich_presence;
 mod start_screen;
+pub mod startup_shell;
 mod theme_editor;
 pub use start_screen::{DecodedStartScreen, StartScreenView};
 mod thread_create;
