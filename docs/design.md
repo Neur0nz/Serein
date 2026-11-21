@@ -6,6 +6,9 @@ accent, softer corner radii and its own server-rail selection language. The pale
 and spacing live in `crates/ui/src/design.rs`; every view resolves colours through
 `design::palette(ui)`.
 
+The [desktop startup design](startup-design.md) covers visible launch, tray startup,
+session restore, and performance targets.
+
 ## Theme tokens and presets
 
 The `Palette` carries surface roles: `base` (title strip and server rail), `sidebar`
