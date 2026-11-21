@@ -564,6 +564,104 @@ memory peaks and decoded video textures are outside this sample. The native firs
 timing ranges overlapped. This component measurement leaves release behavior and time from
 media request to first video frame open.
 
+#### Demand-driven YUV preparation
+
+The candidate creates lightweight video handles with the desktop renderer.
+Explicit Play starts one shader setup alongside the planar attachment decoder
+on Linux and macOS. A watched stream or remote camera can also start it when
+an eligible planar picture is available in the visible window. RGBA upload is
+immediate. Until preparation finishes, the decoder's existing bounded slot
+holds the latest eligible picture. The same renderer reuses its ready shaders
+after a tray hide, and the worker asks for a repaint when it publishes a result.
+
+The playback comparison used locked Rust 1.99.1 fat-LTO builds of `ccf289d8`
+and `a873fe3c` with `--features demo`, on offline 1× Xvfb with llvmpipe Vulkan.
+Both original demos stopped playback in the private audio fixture. The visual
+test used a video-only stream copy of the synthetic MOV,
+padded to the original length with a free atom. All 72 video packet hashes,
+timestamps and durations matched. Each diagnostic binary differed from its
+original release demo only in the embedded fixture bytes.
+
+An XTest Play click starts the ordinary decoder and texture upload. The observer
+polls X11 every 4 ms for the first visible source-confirmed motion. The poster
+and the first decoded picture can look identical. The result measures the first
+distinguishable picture at 24 fps. Playback with audio and presentation on a
+physical display need separate measurements.
+
+| Play to first visible motion | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Reused profile and driver cache, 20 pairs | 165.1 (120.5–374.5) | 155.0 (121.1–301.9) | +0.9 |
+| Fresh profile and driver cache, 15 pairs | 230.6 (148.9–380.8) | 222.3 (147.8–333.8) | −1.1 |
+
+Both cohorts had one warmup for each build and alternated their launch order.
+Every measured run played the clip and exited cleanly. The sample ranges
+overlap, and both paired medians are within the polling interval. The warmed
+observer matched source frame 1 in 18 parent and 20 candidate trials.
+
+A separate Linux syscall trace of the candidate observed zero shader workers
+while displaying the idle poster and one after Play. Both processes exited
+cleanly. Trace runs were excluded from the timing cohorts.
+
+The normal voice-enabled Debian packages from `e179555e` and `a873fe3c` both
+passed the 248-file package smoke check. The optimized demo and its silent
+fixture were separate from these packages.
+
+The first signed-out package comparison ran on Debian 13 with the same
+offline 1× Xvfb and llvmpipe Vulkan renderer. The Xeon Platinum 8573C VM had a
+four-CPU quota and 16 GiB of RAM. Each build had one warmup, then launch order
+alternated. Fresh profiles and Mesa caches were new per launch, and repeat
+profiles and caches were reused per build. The OS page cache was left intact.
+The observer polled X11 every 4 ms. All 70 measured launches exited cleanly.
+
+| Spawn to visible sign-in | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Repeat profile, 20 pairs | 446.1 (356.5–625.4) | 415.4 (352.8–686.2) | −56.0 |
+| Fresh profile, 15 pairs | 728.9 (532.6–1,003.5) | 780.8 (650.1–1,097.6) | +41.6 |
+| Fresh profile, fixed dark theme, 20 pairs | 744.8 (575.1–930.9) | 762.5 (563.3–1,196.3) | +61.9 |
+
+The candidate showed sign-in sooner in 13 repeat and seven fresh pairs. The
+fresh first captures included a dark parent and a light candidate while both
+followed the desktop theme. This can change first-paint work and the frame
+that the observer samples. A third session reversed the starting build and
+used a private GSettings schema that always reported dark, matching egui's
+fallback. All 40 runs presented dark sign-in and exited cleanly. The sampled
+first crops matched pixel for pixel. The candidate was earlier in eight pairs.
+
+Fresh window map to visible pixels took 8.9 ms median on the parent and
+68.7 ms on the candidate in the first comparison, a median paired increase
+of 59.7 ms across 15 pairs. With the fixed theme it took 7.8 ms on the parent
+and 62.3 ms on the candidate, a median paired increase of 50.4 ms. The
+candidate's interval increased in 19 of 20 fixed-theme pairs. The two builds
+can differ in when X11 maps the window and when the first presented pixels
+arrive. Instrument those events to locate the fresh-cache delay before treating
+the candidate as a launch improvement.
+
+Separate memory runs used eight pairs per profile with the default desktop
+theme and eight per profile with the fixed dark theme. The observer read
+process PSS at first sign-in pixels and one second later. All processes exited
+cleanly. PSS includes the software renderer's allocations.
+
+| Median paired change, candidate minus parent | PSS at first content | PSS one second later |
+| --- | ---: | ---: |
+| Default theme, fresh profile | +3,340 KiB | −1,447 KiB |
+| Default theme, repeat profile | +2,319 KiB | −868 KiB |
+| Fixed dark theme, fresh profile | +1,147 KiB | −853 KiB |
+| Fixed dark theme, repeat profile | −730 KiB | −675 KiB |
+
+The default-theme runs had lower one-second PSS in all 16 pairs. Under the
+fixed theme it was lower in seven fresh and five repeat pairs. First-content
+memory varied in both directions. Process CPU between first content and the
+one-second sample changed by a paired median of 0 ms fresh and +160 ms repeat
+under the fixed theme, at 10 ms accounting resolution. Each interval starts at
+that run's own first content, so it can include a different share of work left
+over from launch.
+
+| Package measurement | Parent | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Executable | 107,283,048 bytes | 107,286,120 bytes | +3,072 bytes |
+| Installed size | 109,592 KiB | 109,595 KiB | +3 KiB |
+| Compressed Debian package | 57,037,116 bytes | 57,037,772 bytes | +656 bytes |
+
 ### When to load optional work
 
 Serein has priority and admission rules within individual subsystems. The artwork worker
