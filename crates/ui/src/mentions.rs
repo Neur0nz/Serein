@@ -1049,17 +1049,16 @@ fn row(
 			name.clone()
 		}
 		Candidate::Unicode { text, code } => {
-			match crate::emoji::image(ui.ctx(), text, 24.0) {
-				Some(image) => image.paint_at(ui, icon),
-				None => {
-					ui.painter().text(
-						icon.center(),
-						egui::Align2::CENTER_CENTER,
-						*text,
-						egui::FontId::proportional(18.0),
-						colors.text,
-					);
-				}
+			if let Some(cell) = crate::emoji::lookup(text) {
+				crate::emoji::paint_unicode(ui, text, cell, icon);
+			} else {
+				ui.painter().text(
+					icon.center(),
+					egui::Align2::CENTER_CENTER,
+					*text,
+					egui::FontId::proportional(18.0),
+					colors.text,
+				);
 			}
 			(*code).to_owned()
 		}

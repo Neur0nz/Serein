@@ -16,6 +16,7 @@ struct Inline {
 	label: Option<Arc<egui::Galley>>,
 	background: Color32,
 	image: Option<Image<'static>>,
+	unicode: Option<(usize, String)>,
 	asset: Option<model::ImageShare>,
 	icon: Option<crate::icons::Icon>,
 	game_icon: Option<String>,
@@ -166,7 +167,6 @@ impl Layout {
 		colors.mention_bg.hash(&mut key);
 		colors.muted.hash(&mut key);
 		avatars.revision.hash(&mut key);
-		emoji::ready(ui.ctx()).hash(&mut key);
 		demo.hash(&mut key);
 		if text.contains("<:") || text.contains("<a:") || text.contains("](https://") {
 			static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -221,7 +221,7 @@ impl Layout {
 			let mut asset = None;
 			let mut icon = None;
 			let mut game_icon = None;
-			let mut artwork = false;
+			let mut unicode = None;
 			let length = if let Some((id, len)) = model::game_mention_prefix(tail) {
 				label = Some((games.label(id), colors.mention_text));
 				background = colors.mention_bg;
@@ -293,8 +293,7 @@ impl Layout {
 				len
 			} else {
 				let grapheme = tail.graphemes(true).next().expect("nonempty tail");
-				image = emoji::image(ui.ctx(), grapheme, size);
-				artwork = image.is_some() || emoji::lookup(grapheme).is_some();
+				unicode = emoji::lookup(grapheme).map(|cell| (cell, grapheme.to_owned()));
 				grapheme.len()
 			};
 			let label = label.map(|(text, color)| {
@@ -306,7 +305,7 @@ impl Layout {
 			});
 			let raw = &tail[..length];
 			let count = raw.chars().count();
-			if label.is_some() || image.is_some() || artwork {
+			if label.is_some() || image.is_some() || unicode.is_some() {
 				let slot = label.as_ref().map_or(size, |g| {
 					g.size().x + 6.0 + if icon.is_some() { size } else { 0.0 }
 				});
@@ -320,6 +319,7 @@ impl Layout {
 					label,
 					background,
 					image,
+					unicode,
 					asset,
 					icon,
 					game_icon,
@@ -444,6 +444,12 @@ impl Layout {
 					label.clone(),
 					Color32::PLACEHOLDER,
 				);
+			} else if let Some((cell, grapheme)) = &inline.unicode {
+				let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+				child.set_clip_rect(clip);
+				let square =
+					egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(inline.width));
+				emoji::paint_unicode(&child, grapheme, *cell, square);
 			} else if let Some(image) = &inline.image {
 				let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
 				child.set_clip_rect(clip);

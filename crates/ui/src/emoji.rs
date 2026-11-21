@@ -1,7 +1,7 @@
 //! Bundled Twemoji: an inline atlas and bounded scalable artwork decoded by the media worker.
 use egui::{Context, Image, TextureHandle};
 use image::ImageDecoder;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, mpsc};
 
 const ATLAS: &[u8] = include_bytes!("../../../assets/twemoji/atlas.png");
 const INDEX: &str = include_str!("../../../assets/twemoji/index.tsv");
@@ -84,23 +84,83 @@ fn decode_atlas() -> Result<egui::ColorImage, image::ImageError> {
 	Ok(image)
 }
 
-/// Decode once during application creation, outside the render callback.
+/// The bundled artwork belongs to this graphics context, outside resettable account UI memory.
+#[derive(Default)]
+enum Atlas {
+	#[default]
+	Idle,
+	Decoding(Mutex<mpsc::Receiver<egui::ColorImage>>),
+	Ready(TextureHandle),
+	Failed,
+}
+
+impl egui::Plugin for Atlas {
+	fn debug_name(&self) -> &'static str {
+		"Twemoji atlas"
+	}
+}
+
+/// Let visible Unicode artwork start the one atlas decode for this desktop context.
+pub fn load_on_demand(ctx: &Context) {
+	ctx.add_plugin(Atlas::default());
+}
+
+/// Install synchronously for fixtures that need the artwork on their first pass.
 pub fn install(ctx: &Context) -> Result<(), image::ImageError> {
-	let texture = ctx.load_texture(
-		"Twemoji 17.0.3",
-		decode_atlas()?,
-		egui::TextureOptions::LINEAR,
-	);
-	ctx.data_mut(|data| data.insert_temp(egui::Id::unique("twemoji"), texture));
+	let atlas = ctx.plugin_or_default::<Atlas>();
+	let mut atlas = atlas.lock();
+	if !matches!(*atlas, Atlas::Ready(_)) {
+		*atlas = Atlas::Ready(upload(ctx, decode_atlas()?));
+	}
 	entries();
 	Ok(())
 }
 
-pub(crate) fn ready(ctx: &Context) -> bool {
-	ctx.data(|data| {
-		data.get_temp::<TextureHandle>(egui::Id::unique("twemoji"))
-			.is_some()
-	})
+fn upload(ctx: &Context, image: egui::ColorImage) -> TextureHandle {
+	ctx.load_texture("Twemoji 17.0.3", image, egui::TextureOptions::LINEAR)
+}
+
+impl Atlas {
+	fn visible(&mut self, ctx: &Context) -> Option<egui::load::SizedTexture> {
+		let image = match self {
+			Self::Ready(texture) => return Some((&*texture).into()),
+			Self::Failed => return None,
+			Self::Idle => {
+				let (send, receive) = mpsc::sync_channel(1);
+				let wake = ctx.clone();
+				let worker = std::thread::Builder::new()
+					.name("serein-emoji-atlas".into())
+					.spawn(move || {
+						if let Ok(image) = decode_atlas() {
+							let _ = send.send(image);
+						}
+						drop(send);
+						wake.request_repaint();
+					});
+				*self = if worker.is_ok() {
+					Self::Decoding(Mutex::new(receive))
+				} else {
+					Self::Failed
+				};
+				return None;
+			}
+			Self::Decoding(receive) => {
+				match receive.get_mut().expect("atlas receiver").try_recv() {
+					Ok(image) => image,
+					Err(mpsc::TryRecvError::Empty) => return None,
+					Err(mpsc::TryRecvError::Disconnected) => {
+						*self = Self::Failed;
+						return None;
+					}
+				}
+			}
+		};
+		// Completion wakes the app, but only a visible consumer queues the GPU upload.
+		let texture = upload(ctx, image);
+		let sized = (&texture).into();
+		*self = Self::Ready(texture);
+		Some(sized)
+	}
 }
 
 pub(crate) fn inline_size(ui: &egui::Ui) -> f32 {
@@ -163,14 +223,59 @@ pub(crate) fn presentation(text: &str) -> std::borrow::Cow<'_, str> {
 	std::borrow::Cow::Owned(marked)
 }
 
-pub(crate) fn image(ctx: &Context, text: &str, size: f32) -> Option<Image<'static>> {
-	let cell = lookup(text)?;
-	Some(image_cell(atlas(ctx)?, text, cell, size))
+pub(crate) fn image(
+	ui: &egui::Ui,
+	text: &str,
+	cell: usize,
+	rect: egui::Rect,
+) -> Option<Image<'static>> {
+	if !artwork_is_visible(ui, rect) {
+		return None;
+	}
+	Some(image_cell(
+		visible_atlas(ui.ctx())?,
+		text,
+		cell,
+		rect.width(),
+	))
 }
 
-pub(crate) fn atlas(ctx: &Context) -> Option<egui::load::SizedTexture> {
-	let texture = ctx.data(|data| data.get_temp::<TextureHandle>(egui::Id::unique("twemoji")))?;
-	Some((&texture).into())
+/// Request the atlas only for a recognized Unicode cell about to be drawn.
+pub(crate) fn visible_atlas(ctx: &Context) -> Option<egui::load::SizedTexture> {
+	ctx.with_plugin(|atlas: &mut Atlas| atlas.visible(ctx))?
+}
+
+pub(crate) fn artwork_is_visible(ui: &egui::Ui, rect: egui::Rect) -> bool {
+	!ui.is_sizing_pass() && ui.is_rect_visible(rect) && rect.intersect(ui.clip_rect()).is_positive()
+}
+
+/// Keep the artwork slot stable while the atlas is unavailable without consulting system emoji fonts.
+pub(crate) fn paint_placeholder(ui: &egui::Ui, rect: egui::Rect) {
+	if artwork_is_visible(ui, rect) {
+		let size = rect.width().min(rect.height()) * 0.55;
+		ui.painter().rect_filled(
+			egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size)),
+			size * 0.25,
+			ui.visuals().weak_text_color().gamma_multiply(0.25),
+		);
+	}
+}
+
+pub(crate) fn paint_unicode(ui: &egui::Ui, text: &str, cell: usize, rect: egui::Rect) {
+	if let Some(image) = image(ui, text, cell, rect) {
+		image.paint_at(ui, rect);
+	} else {
+		paint_placeholder(ui, rect);
+	}
+}
+
+pub(crate) fn atom(ui: &egui::Ui, text: String, cell: usize, size: f32) -> egui::Atom<'static> {
+	// Match the font-sized artwork used by egui's image buttons.
+	let font = egui::FontSelection::default().resolve(ui.style());
+	let size = size.min(ui.fonts_mut(|fonts| fonts.row_height(&font)));
+	egui::Atom::paint(egui::Vec2::splat(size), move |ui, args| {
+		paint_unicode(ui, &text, cell, args.rect);
+	})
 }
 
 pub(crate) fn image_cell(
@@ -188,14 +293,6 @@ pub(crate) fn image_cell(
 	Image::new((atlas.id, egui::Vec2::splat(size)))
 		.uv(uv)
 		.alt_text(text)
-}
-
-pub(crate) fn button(ctx: &Context, emoji: &str, text: String) -> egui::Button<'static> {
-	if let Some(image) = image(ctx, emoji, 18.0) {
-		egui::Button::image_and_text(image, text).image_tint_follows_text_color(false)
-	} else {
-		egui::Button::new(format!("{emoji} {text}"))
-	}
 }
 
 pub(crate) fn blank(ctx: &Context, size: f32) -> Image<'static> {
@@ -235,6 +332,89 @@ pub(crate) fn custom_prefix(text: &str) -> Option<(model::Id, usize)> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_ready_atlas_waits_for_visible_artwork_and_survives_account_ui_reset() {
+		let ctx = Context::default();
+		let (send, receive) = mpsc::sync_channel(1);
+		ctx.add_plugin(Atlas::Decoding(Mutex::new(receive)));
+		send.send(egui::ColorImage::filled([1, 1], egui::Color32::WHITE))
+			.unwrap();
+		let draw_plain_preview = |ui: &mut egui::Ui| {
+			let galley = ui.painter().layout_no_wrap(
+				"No emoji".into(),
+				egui::FontId::default(),
+				egui::Color32::WHITE,
+			);
+			crate::markdown::Formatted::paint_inline_preview_emojis(
+				ui,
+				ui.min_rect().min,
+				&galley,
+				&[],
+			);
+			let clipped = ui
+				.clip_rect()
+				.translate(egui::vec2(ui.clip_rect().width() + 1.0, 0.0));
+			assert!(image(ui, "🙂", lookup("🙂").unwrap(), clipped).is_none());
+			let sizing = ui.new_child(egui::UiBuilder::new().sizing_pass());
+			let inside =
+				egui::Rect::from_center_size(sizing.clip_rect().center(), egui::vec2(18.0, 18.0));
+			assert!(image(&sizing, "🙂", lookup("🙂").unwrap(), inside).is_none());
+		};
+		ctx.run_ui(egui::RawInput::default(), draw_plain_preview)
+			.drop_without_applying_deltas();
+		assert_eq!(
+			ctx.with_plugin(|atlas: &mut Atlas| matches!(atlas, Atlas::Decoding(_))),
+			Some(true),
+		);
+		let draw_forum_tag = |ui: &mut egui::Ui| {
+			crate::forum::tag_pill(
+				ui,
+				(&mut crate::avatars::Avatars::default(), true),
+				&model::forum::Tag {
+					id: model::Id(1),
+					name: "Forum tag".into(),
+					moderated: false,
+					emoji_id: None,
+					emoji_name: Some("🙂".into()),
+				},
+				false,
+				24.0,
+				egui::Sense::hover(),
+			);
+		};
+		let ready = ctx.run_ui(egui::RawInput::default(), draw_forum_tag);
+		let atlas_id = ctx
+			.with_plugin(|atlas: &mut Atlas| match atlas {
+				Atlas::Ready(texture) => texture.id(),
+				_ => panic!("visible forum emoji did not publish the atlas"),
+			})
+			.unwrap();
+		assert!(
+			ready
+				.textures_delta
+				.set
+				.iter()
+				.any(|(id, _)| *id == atlas_id)
+		);
+		ready.drop_without_applying_deltas();
+		ctx.memory_mut(|memory| *memory = egui::Memory::default());
+		let reopened = ctx.run_ui(egui::RawInput::default(), draw_forum_tag);
+		assert!(
+			!reopened
+				.textures_delta
+				.set
+				.iter()
+				.any(|(id, _)| *id == atlas_id)
+		);
+		reopened.drop_without_applying_deltas();
+		assert_eq!(
+			ctx.with_plugin(
+				|atlas: &mut Atlas| matches!(atlas, Atlas::Ready(texture) if texture.id() == atlas_id)
+			),
+			Some(true),
+		);
+	}
 
 	/// Plain-text names colour ✌ like Discord does, without touching emoji or text forms.
 	#[test]

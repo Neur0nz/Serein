@@ -14,6 +14,7 @@ pub struct Artwork {
 	pub rect: Rect,
 	pub image: Option<egui::Image<'static>>,
 	pub fallback: Option<Arc<Galley>>,
+	pub pending_unicode: bool,
 }
 
 struct Run {
@@ -956,6 +957,8 @@ fn paint_artwork(ui: &egui::Ui, art: &Artwork) {
 			label.clone(),
 			ui.visuals().text_color(),
 		);
+	} else if art.pending_unicode {
+		crate::emoji::paint_placeholder(ui, art.rect);
 	}
 }
 

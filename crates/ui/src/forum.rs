@@ -1325,10 +1325,9 @@ fn tag_font(ui: &egui::Ui, height: f32) -> egui::FontId {
 	)
 }
 
-/// Does this emoji have artwork to paint: a custom emoji, or a Unicode one in the atlas?
-fn has_emoji(ctx: &egui::Context, id: Option<Id>, name: Option<&str>) -> bool {
-	id.is_some()
-		|| name.is_some_and(|name| crate::emoji::lookup(name).is_some() && crate::emoji::ready(ctx))
+/// Reserve the artwork slot even while the bundled atlas is still loading.
+fn has_emoji(id: Option<Id>, name: Option<&str>) -> bool {
+	id.is_some() || name.is_some_and(|name| crate::emoji::lookup(name).is_some())
 }
 
 /// Paint a custom emoji from the image cache, or a Unicode one from the Twemoji atlas.
@@ -1338,12 +1337,14 @@ pub(crate) fn paint_emoji(
 	(id, name): (Option<Id>, Option<&str>),
 	rect: egui::Rect,
 ) {
-	let image = match id {
-		Some(id) => images.custom_image(ui.ctx(), id, rect.width(), demo),
-		None => name.and_then(|name| crate::emoji::image(ui.ctx(), name, rect.width())),
-	};
-	if let Some(image) = image {
-		image.paint_at(ui, rect);
+	if let Some(id) = id {
+		if let Some(image) = images.custom_image(ui.ctx(), id, rect.width(), demo) {
+			image.paint_at(ui, rect);
+		}
+	} else if let Some(name) = name
+		&& let Some(cell) = crate::emoji::lookup(name)
+	{
+		crate::emoji::paint_unicode(ui, name, cell, rect);
 	}
 }
 
@@ -1353,7 +1354,7 @@ pub(crate) fn pill_width(ui: &egui::Ui, tag: &Tag, height: f32) -> f32 {
 		.layout_no_wrap(tag.name.clone(), tag_font(ui, height), egui::Color32::WHITE)
 		.size()
 		.x;
-	let emoji = if has_emoji(ui.ctx(), tag.emoji_id, tag.emoji_name.as_deref()) {
+	let emoji = if has_emoji(tag.emoji_id, tag.emoji_name.as_deref()) {
 		(height * 0.6).round() + 6.0
 	} else {
 		0.0
@@ -1412,7 +1413,7 @@ pub(crate) fn tag_pill(
 		);
 	}
 	let mut x = rect.left() + (height * 0.45).round();
-	if has_emoji(ui.ctx(), tag.emoji_id, tag.emoji_name.as_deref()) {
+	if has_emoji(tag.emoji_id, tag.emoji_name.as_deref()) {
 		let size = (height * 0.6).round();
 		paint_emoji(
 			ui,

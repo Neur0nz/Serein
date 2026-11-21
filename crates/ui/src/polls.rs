@@ -79,16 +79,12 @@ impl Cards {
 					} else {
 						selected.contains(&answer.id)
 					};
-					let emoji =
-						answer.media.emoji.as_ref().and_then(|emoji| {
-							emoji_image(ui.ctx(), avatars, emoji, 24.0, state.demo)
-						});
 					let response = ui
 						.add_enabled_ui(results || enabled, |ui| {
 							answer_row(
 								ui,
 								answer,
-								emoji,
+								(avatars, state.demo),
 								checked,
 								results,
 								poll.results_known,
@@ -252,24 +248,10 @@ fn vote_label(votes: u64) -> String {
 	)
 }
 
-/// Bundled Twemoji artwork for Unicode emoji, the bounded image cache for custom ones.
-fn emoji_image(
-	ctx: &egui::Context,
-	avatars: &mut Avatars,
-	emoji: &ReactionEmoji,
-	size: f32,
-	demo: bool,
-) -> Option<egui::Image<'static>> {
-	match emoji.id {
-		Some(id) => avatars.custom_image(ctx, id, size, demo),
-		None => crate::emoji::image(ctx, emoji.name.as_deref()?, size),
-	}
-}
-
 fn answer_row(
 	ui: &mut egui::Ui,
 	answer: &model::polls::Answer,
-	emoji_image: Option<egui::Image<'static>>,
+	media: (&mut Avatars, bool),
 	checked: bool,
 	results: bool,
 	known: bool,
@@ -285,7 +267,19 @@ fn answer_row(
 		|| answer.media.text.clone(),
 		|emoji| format!("{} {}", emoji.label(), answer.media.text),
 	);
-	let emoji_width = if emoji_image.is_some() { 32.0 } else { 0.0 };
+	let mut unicode = None;
+	let mut custom = None;
+	if let Some(emoji) = &answer.media.emoji {
+		if let Some(id) = emoji.id {
+			custom = media.0.custom_image(ui.ctx(), id, 24.0, media.1);
+		} else if let Some(name) = emoji.name.as_deref()
+			&& let Some(cell) = crate::emoji::lookup(name)
+		{
+			unicode = Some((name, cell));
+		}
+	}
+	let has_artwork = custom.is_some() || unicode.is_some();
+	let emoji_width = if has_artwork { 32.0 } else { 0.0 };
 	let width = ui.available_width();
 	let show_tally = results && known;
 	let count_width = if show_tally {
@@ -308,7 +302,7 @@ fn answer_row(
 		0.0
 	};
 	let text = ui.painter().layout(
-		if emoji_image.is_some() {
+		if has_artwork {
 			answer.media.text.clone()
 		} else {
 			label.clone()
@@ -383,14 +377,14 @@ fn answer_row(
 	} else {
 		p.muted
 	};
-	if let Some(image) = emoji_image {
-		image.paint_at(
-			ui,
-			egui::Rect::from_min_size(
-				egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
-				egui::Vec2::splat(24.0),
-			),
-		);
+	let art = egui::Rect::from_min_size(
+		egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
+		egui::Vec2::splat(24.0),
+	);
+	if let Some((name, cell)) = unicode {
+		crate::emoji::paint_unicode(ui, name, cell, art);
+	} else if let Some(image) = custom {
+		image.paint_at(ui, art);
 	}
 	painter.galley_with_override_text_color(
 		egui::pos2(
@@ -736,10 +730,17 @@ fn emoji_button(
 	}
 	let art = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(22.0));
 	match emoji {
-		Some(emoji) => match emoji_image(ui.ctx(), avatars, emoji, 22.0, demo) {
-			Some(image) => image.paint_at(ui, art),
-			// Outside the bundled set: the raw glyph keeps the choice visible.
-			None if emoji.id.is_none() => {
+		Some(emoji) => {
+			if let Some(id) = emoji.id {
+				if let Some(image) = avatars.custom_image(ui.ctx(), id, 22.0, demo) {
+					image.paint_at(ui, art);
+				}
+			} else if let Some(name) = emoji.name.as_deref()
+				&& let Some(cell) = crate::emoji::lookup(name)
+			{
+				crate::emoji::paint_unicode(ui, name, cell, art);
+			} else {
+				// Outside the bundled set: the raw glyph keeps the choice visible.
 				ui.painter().text(
 					rect.center(),
 					egui::Align2::CENTER_CENTER,
@@ -748,9 +749,7 @@ fn emoji_button(
 					p.text_strong,
 				);
 			}
-			// Custom artwork still loading.
-			None => {}
-		},
+		}
 		None => icons::paint(
 			ui.painter(),
 			Icon::Smile,

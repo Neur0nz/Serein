@@ -393,8 +393,12 @@ fn option_card(
 		.show(ui, |ui| {
 			ui.set_width(ui.available_width());
 			ui.horizontal(|ui| {
-				if let Some(image) = emoji.and_then(|e| crate::emoji::image(ui.ctx(), e, 22.0)) {
-					ui.add(image);
+				if let Some(emoji) = emoji
+					&& let Some(cell) = crate::emoji::lookup(emoji)
+				{
+					let (art, _) =
+						ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::hover());
+					crate::emoji::paint_unicode(ui, emoji, cell, art);
 				}
 				ui.vertical(|ui| {
 					ui.spacing_mut().item_spacing.y = 2.0;

@@ -1044,14 +1044,15 @@ Pinned-message summaries share search's single session-only 25-item / 64 KiB res
 
 Uploads do not persist local source paths, signed staging targets or file bytes. Pending filename/size labels remain bounded session metadata; existing recovery drafts retain only composed text, so retrying an attachment requires selecting the source again. Files are opened for reading and checked for observable size/modification changes; this is not an immutable snapshot guarantee. Cancellation stops the local job, but bytes already uploaded to Discord staging may remain there without a created message; no remote cleanup or retention guarantee is claimed. Completed messages and their returned attachment metadata can enter the existing bounded history cache. The OS file picker may retain OS-managed recent-location history. No new application log or hidden upload recovery store is introduced.
 
-Twemoji artwork is public bundled data, not an account cache: one 5,225,108-byte PNG
-and a fixed 4,009-entry Unicode index are embedded in the executable. A startup worker
-decodes one 2,048×2,016 RGBA atlas (15.75 MiB); the GPU texture has the same pixel
-payload, with driver overhead additional. The decoder writes directly into the final
-CPU pixel buffer and premultiplies alpha in place; decoder scratch and upload staging
-can add temporary storage. The context retains the single atlas until exit,
-including across logout; there are no emoji downloads, disk writes, or growing texture
-queues. Unknown sequences and explicit text-presentation selectors remain font text.
+The executable embeds public Twemoji artwork as one 5,225,108-byte PNG and a fixed
+4,009-entry Unicode index. The first visible request for a supported emoji starts
+one background decode of the 2,048×2,016 RGBA atlas (15.75 MiB). A visible
+consumer queues the finished pixels for upload. Pending emoji reserve their normal
+artwork space. The decoder writes into the final CPU buffer and premultiplies alpha
+in place. One completed buffer can wait for demand. The GPU texture has the same
+pixel payload, with additional driver, decode and staging overhead. The context retains
+the uploaded atlas across logout and releases it at exit. Bundled emoji use memory
+only. Unknown sequences and explicit text-presentation selectors remain font text.
 
 GIF search and trending results retain at most eight session-memory pages / 768 KiB for ten
 minutes. Reopening a fresh query reuses its page without a REST request; least-recently-used
