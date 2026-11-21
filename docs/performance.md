@@ -391,6 +391,91 @@ samples leave the rapid-reopen tail unresolved.
 | Full package installed size, KiB | 109,581 | 109,585 | +4 |
 | Compressed package bytes | 57,042,440 | 57,033,308 | −9,132 |
 
+### Foreground launch and X11 global shortcuts
+
+The X11 hotkey worker in `global-hotkey` 0.8.0 serviced one command per poll
+and then slept for 50 ms. The desktop waits for each configured registration
+during window setup. On a signed-out default profile, it registers both the
+mute and deafen shortcuts before first paint.
+
+A diagnostic ran the same standard Debian executable (`47af0a19`) with only
+`keybinds.global_enabled` changed. The two profiles were cloned from the same
+warmed no-account SQLite store and graphics cache. On 1× Xvfb with llvmpipe
+Vulkan, a private D-Bus session and networking disabled, each setting had one
+warmup before 20 alternating repeat-launch pairs. All 40 measured runs exited
+cleanly. Both settings still created the system hotkey manager.
+
+| Milestone | Global shortcuts on, median (range), ms | Global shortcuts off, median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| X11 window mapped | 432.9 (383.8–768.1) | 353.5 (308.8–583.7) | −88.2 |
+| Varied sign-in pixels | 439.5 (390.3–782.3) | 407.6 (353.1–653.6) | −49.7 |
+
+Disabling the shortcut path shifted the visible milestone earlier in 14 of 20
+pairs. The ranges overlap. Compare the worker directly and keep global shortcuts
+enabled when comparing production packages.
+
+The patched worker lets requests wake the existing thread immediately. At each
+wake it handles pending X11 events before the command. In a separate direct
+test, each fresh process created the manager and registered Ctrl+Shift+M and
+Ctrl+Shift+D in order. The split builds used the same Rust release profile, a
+private Xvfb session, one warmup each and 12 alternating pairs.
+
+| Direct worker measurement | Registry median (range), ms | Patched median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Second registration | 50.392 (50.256–54.468) | 0.230 (0.185–3.747) | −50.147 |
+| Manager and both registrations | 72.752 (69.501–94.819) | 23.058 (20.330–91.738) | −50.188 |
+
+The second registration improved in every pair. Manager setup and the first
+registration are included in the total. Both builds also passed a competing
+grab, XTest press and release during an 820 ms repeat-enabled hold, suppression
+of events after unregister, and shortcut reacquisition after dropping the
+owner. Reassignment before drop used a checked round trip on the same
+connection to flush the buffered ungrab.
+
+#### Packaged launch comparison
+
+Standard voice-enabled Debian packages from `47af0a19` and `e179555e` ran
+signed out with global shortcuts enabled. The offline Xeon Platinum 8573C VM
+had a four-CPU quota and 16 GiB RAM. Both builds used llvmpipe Vulkan on a
+1440×1000 Xvfb display at scale 1. The 4 ms X11 observer timed each launch
+from process dispatch. It observed every measured launch exit cleanly.
+
+Five independent display and D-Bus sessions measured 20 repeat pairs each.
+Within each session, each build warmed its own profile once before the samples.
+Launch order alternated within and between sessions. The p95 is nearest rank
+over 100 launches per build.
+
+| Repeat milestone | Parent p50 / p95, ms | Patched p50 / p95, ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| X11 window mapped | 465.7 / 756.3 | 375.2 / 691.8 | −78.9 |
+| Varied sign-in pixels | 469.4 / 777.9 | 416.7 / 702.3 | −52.2 |
+
+The visible milestone occurred earlier in 71 of 100 pairs. All five sessions
+had a lower paired median, ranging from −152.1 to −26.7 ms. Observed visible
+times ranged from 372.9 to 1,039.2 ms on the parent and 322.8 to 744.2 ms on the
+candidate. These results describe software rendering on this VM.
+
+Fresh trials created a new no-account profile and driver cache for each
+launch. The OS page cache stayed warm. In the 15-pair cohort, visible p50 was
+738.7 ms on the parent and 759.4 ms on the candidate, with a median paired
+change of −64.7 ms. In a second 20-pair cohort it was 883.5 ms and 876.3 ms,
+with a median paired change of −23.5 ms. The candidate was faster in 19 of
+35 pairs, with mixed cohort medians and overlapping ranges.
+
+In separate process-memory cohorts of five and eight repeat pairs, median
+PSS at first content was 5,403 KiB higher and 2,379 KiB lower, respectively.
+One second later the differences were −297 and +219 KiB. The median
+process CPU over that second moved by −5 and +4 ticks (10 ms per tick).
+These samples leave the first-frame and settled differences inconclusive.
+PSS apportions shared resident pages to the Serein process. Dedicated GPU
+memory and the X11 server's memory are outside the sample.
+
+| Standard Debian build | Parent | Patched | Change |
+| --- | ---: | ---: | ---: |
+| Executable bytes | 107,277,672 | 107,283,048 | +5,376 |
+| Full package installed size, KiB | 109,585 | 109,592 | +7 |
+| Compressed package bytes | 57,033,308 | 57,037,116 | +3,808 |
+
 ### What the baseline does at launch
 
 | Milestone | Work on the critical path |

@@ -16,6 +16,11 @@ Linux tray integration uses **ksni 0.3.6** (Unlicense), reusing zbus, Tokio and 
 The unmodified license is retained in `assets/licenses/files/ksni-0.3.6-UNLICENSE`;
 `Cargo.lock` records the archive checksum.
 
+Native shortcuts use **global-hotkey 0.8.0** (Apache-2.0 OR MIT). Serein uses the
+MIT option and bundles its unmodified text at
+`assets/licenses/files/global-hotkey-0.8.0-LICENSE-MIT`. The local X11 patch and
+source archive checksum are documented in `vendor/global-hotkey/SEREIN-PATCH.md`.
+
 Linux call audio enables CPAL’s PulseAudio backend with **pulseaudio 0.3.1**
 (MIT), **enum-primitive-derive 0.3.0** (MIT), and **futures 0.3.34**
 (MIT OR Apache-2.0). Their unmodified license texts and provenance are bundled
