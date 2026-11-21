@@ -162,6 +162,22 @@ The fixture dismissed Settings and needed forced exit after timing. Compare focu
 sign-in field separately from Settings so input scheduling and the cost of loading the
 full pane can be judged independently.
 
+### First sign-in layout
+
+The first-focus probe on the packaged prototype missed the password field during an
+approximately 35 px layout shift. One click after the field settled reached its focus
+ring 84 ms later. That exploratory run needed forced cleanup after timing, so the planned
+repeat cohort did not run.
+
+Native debug builds at `5340c069` and `9a1e9b34` ran offline with
+`--demo --demo-login=new --demo-light`. At 1× and 1120 × 760, the first parent frame put
+the Log In button at y=473 px, and the settled frame drew it at y=416 px. The candidate
+drew it at y=416 px in both captures. The candidate's first and settled images matched
+the parent's settled image pixel for pixel. The 1.25× and 2× captures also matched their
+settled images. The observer did not catch a separate parent transition at those scales.
+All six demo launches exited cleanly. The capture checks geometry and appearance. The
+packaged tests measure startup latency separately.
+
 ### Minimal release renderer control on Linux
 
 Compared the packaged `afe73481` prototype with a small eframe window using the same
