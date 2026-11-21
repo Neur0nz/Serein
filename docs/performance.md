@@ -110,7 +110,121 @@ rendering and observed X11 pixels. Input response, physical-display timing and a
 startup remain unmeasured. Credential handling, READY identity and permission checks, and live
 history have separate prerequisites from the first window.
 
-### What the baseline does at launch
+### Packaged startup baseline at `5340c069`
+
+Built the standard unsigned Linux Debian package with pinned Rust 1.99.1 and
+`cargo xtask package`. The package smoke verified 247 installed files and the
+shared-library closure. The executable was 107,272,680 B, the installed files
+totaled 112,000,982 B, and the compressed distribution was 57,039,360 B.
+
+The extracted executable ran offline on the same Linux x86-64 Xeon host and
+four-CPU quota as the debug trace. A private Xvfb display at 1440 × 1000 × 24
+used llvmpipe Vulkan, and the app ran in a private D-Bus session with an isolated
+data root. The observer polled the app window every 4 ms. One warmup and 15
+direct process launches per case used a fresh no-account profile each time
+or reused an initialized no-account profile. All 30 measured launches exited
+cleanly.
+
+| Scenario | Median to map | Median to visible sign-in | Visible range |
+| --- | ---: | ---: | ---: |
+| Fresh profile | 913 ms | 922 ms | 624–1,687 ms |
+| Repeat profile | 480 ms | 481 ms | 376–619 ms |
+
+These standalone baseline samples describe software-rendered Linux. They
+leave physical hardware timing, p95, input response, and saved-account restore
+unmeasured.
+
+### Packaged startup after deferring Twemoji
+
+Compared `5340c069` and `afe73481` using their standard voice-enabled Debian
+packages from the same Rust 1.99.1 toolchain and locked release profile. Both
+packages passed the 247-file smoke test. The Xeon Platinum 8573C host had a
+four-CPU quota and a 16 GiB limit. The private 1440 × 1000 × 24 Xvfb display
+used llvmpipe Vulkan (LLVM 19.1.7) at 1×. Both apps ran with networking disabled
+and private D-Bus and data roots. Fresh launches used a new profile and Mesa
+cache each time. Repeat launches reused one profile and Mesa cache per package.
+The OS page cache was left intact.
+
+Each profile and package had one warmup. Then 15 rounds alternated launch
+order within each profile so each pair ran close together. The observer polled
+X11 every 4 ms for the mapped window and varied sign-in pixels. All 60 launches
+exited cleanly.
+
+| Profile and milestone | Parent median (range), ms | Candidate median (range), ms | Median paired change, ms |
+| --- | ---: | ---: | ---: |
+| Fresh, mapped window | 620 (583–897) | 561 (506–897) | −30 |
+| Fresh, visible sign-in | 626 (589–903) | 567 (507–912) | −22 |
+| Repeat, mapped window | 483 (366–786) | 322 (287–701) | −102 |
+| Repeat, visible sign-in | 488 (372–793) | 323 (290–707) | −102 |
+
+Paired change is the median of same-round differences. The candidate reached
+visible sign-in sooner in 10 of 15 fresh pairs and 13 of 15 repeat pairs. The
+ranges overlap. Fresh timing also varied between sessions, with a 922 ms
+standalone baseline median and a 626 ms interleaved baseline median. The
+interleaved comparison describes the effect in this environment. It leaves
+hardware display, p95 and saved-account startup unmeasured.
+
+Five additional alternating launches per package and profile sampled
+`/proc/<pid>/smaps_rollup` at first visible content and one second later.
+These probes ran separately from the latency samples. All 20 exited cleanly.
+
+| Profile and measurement | Parent median, KiB | Candidate median, KiB | Median paired change, KiB |
+| --- | ---: | ---: | ---: |
+| Fresh RSS at first content | 275,052 | 239,528 | −36,440 |
+| Fresh RSS after 1 s | 284,128 | 247,656 | −36,440 |
+| Repeat RSS at first content | 262,076 | 224,972 | −37,180 |
+| Repeat RSS after 1 s | 271,552 | 234,604 | −37,100 |
+| Fresh PSS at first content | 246,951 | 211,408 | −36,437 |
+| Repeat PSS at first content | 233,938 | 196,935 | −37,052 |
+
+At first content private dirty memory dropped by a paired median of 32,080
+KiB on fresh profiles and 32,480 KiB on repeat profiles. Observed peak RSS
+through the one-second sample (`VmHWM`) fell by 36,440 KiB fresh and 37,072 KiB
+repeat. These are whole-process measurements with a software driver. Per-process
+CPU in the second after first content had overlapping ranges. Fresh was 56
+(48–72) ticks on the parent and 47 (34–72) on the candidate. Repeat was 43
+(37–51) and 44 (37–46), respectively. One tick was 10 ms. Sustained idle CPU
+and dedicated GPU memory remain unmeasured.
+
+| Package measurement | Parent, bytes | Candidate, bytes | Change, bytes |
+| --- | ---: | ---: | ---: |
+| Executable | 107,272,680 | 107,296,232 | +23,552 |
+| Installed files | 112,000,982 | 112,024,534 | +23,552 |
+| Compressed Debian package | 57,039,360 | 57,047,496 | +8,136 |
+
+#### Early local action
+
+In a separate exploratory test, XTest clicked the Settings gear on the first
+observed sign-in frame containing the heading and gear. The observer sampled the
+Settings navigation pixels away from hover. There were three alternating launches
+per build and profile after one warmup, using the same packaged binaries and
+offline software renderer. All 12 measured clicks opened Settings.
+
+| Profile and measurement | Parent median (range), ms | Candidate median (range), ms |
+| --- | ---: | ---: |
+| Fresh, click to Settings | 281 (255–333) | 321 (298–327) |
+| Fresh, launch to Settings | 1,028 (971–1,030) | 905 (863–1,004) |
+| Repeat, click to Settings | 272 (256–301) | 317 (259–423) |
+| Repeat, launch to Settings | 679 (676–859) | 639 (587–803) |
+
+Settings appeared sooner from launch in these samples. The click-to-response
+medians rose and the ranges overlap. Profile the click-to-response path with the
+next first UI pass trace, including which initialization spans still run when
+the earlier click arrives. The measured repeat launches exited cleanly. The
+fresh launches on both builds and the warmups needed forced cleanup after the
+settings action and timing had finished.
+
+#### First emoji view
+
+The offline 1120 × 760 `--demo --demo-emoji` fixture opens the picker from launch.
+Native debug captures caught the same opening fade with artwork in the parent and
+fixed-size placeholders in the candidate. Settled picker and restore-shell captures
+matched pixel for pixel. In a separate five-round alternating debug probe, the
+picker chrome and two sampled artwork tiles first met the pixel detector in the
+same X11 read in every launch. All ten exited cleanly. That probe could not resolve
+the artwork delay. Keep release first-use timing in the next foreground profiling pass.
+
+### Launch work at `39780338`
 
 | Milestone | Work on the critical path |
 | --- | --- |
@@ -155,15 +269,20 @@ off the UI thread. They can still contend for resources during launch.
 1. Time database initialization, renderer creation, asset preparation, and submission of
    the first frame separately. Record when the shell first responds to input and look at
    frame times through the handoff to live chat. Compare a new profile, an existing
-   current-schema profile, and a migration separately. Test slower or locked storage while
-   preserving the initial window preferences. Video conversion is a good first candidate to
-   move behind media demand. Compare the first video frame too, to check for a playback hitch.
+   current-schema profile, and a migration separately. Split the initial UI pass into app
+   logic, the active view and egui overhead. The native sign-in form constructs its HTTP
+   client on the UI thread before it starts workers. Measure that work separately from
+   form layout, translation catalog loading, font fallback and the icon layers requested
+   by the visible screen. Check the needed layers at 1×, fractional and 2× scale before
+   moving icon setup. Test slower or locked storage while preserving initial window preferences.
 2. For the rewritten restore flow, test delayed last-conversation reads, manual navigation
    while the read is pending, and missing or inaccessible selections. Profile the time from
    worker READY to UI READY, selected channel and fresh history separately. If the selection
    read competes with settings-only work, investigate deferring those reads.
 3. Measure large READY separately from launch and profile UI sorting and remaining network
    waits before changing their ordering.
+4. Move video conversion setup behind media demand. Measure first video frame latency and
+   how the first foreground action responds when conversion setup is already in flight.
 
 ### Video conversion setup on offline Linux
 
