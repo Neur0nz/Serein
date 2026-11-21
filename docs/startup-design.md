@@ -195,10 +195,10 @@ and required cleanup under their existing rules. [Current close behavior](design
 ## Performance targets
 
 The proposed budgets are in milliseconds for packaged release builds with voice enabled
-and the ordinary renderer policy. Reference hardware means supported SSD systems with a
-mainstream hardware GPU, measured separately per platform. Use an older supported iGPU
-and SSD as a lower-end cohort. Treat first local UI and live session readiness as
-separate measurements.
+and the ordinary renderer policy. Apply the reference budgets separately to midrange
+discrete graphics and capable integrated graphics. Use an older supported iGPU and SSD
+as a lower-end cohort. Treat first local UI and live session readiness as separate
+measurements.
 
 | Milestone | Reference p50 / p95 | Lower-end p50 / p95 |
 | --- | ---: | ---: |
@@ -218,14 +218,40 @@ overhead above that floor. Where repeat launch has headroom, consider a stretch 
 when selecting a target. Record any benchmark-dependent change to the target before
 comparing results.
 
+### Reference systems
+
+| System | What to measure |
+| --- | --- |
+| Development Linux VM | Use for repeatable release comparisons, phase traces, synthetic restore, and offline tray tests. This VM currently has no hardware GPU exposed, so its Vulkan llvmpipe timings describe software rendering. A hardware-backed adapter exposed to the VM can qualify as a separate Linux reference. |
+| Local Windows PC with RTX 2070 | Use as the first discrete GPU reference. Start with the packaged app's Automatic graphics policy and record the actual adapter and backend. |
+| Capable integrated GPU | Use a recent AMD Radeon or Intel Arc iGPU on an SSD system as a second reference. Record the hardware adapter and memory configuration on each run. On a hybrid PC, verify which adapter actually renders Serein. |
+
+For both GPU cohorts, start with an idle desktop and compare repeat launch, resident
+tray Show, and early input under a separate, repeatable game-like workload. Use the same
+load for each build and record its frame times alongside Serein's response. Record CPU,
+GPU and driver, RAM configuration, storage, power mode, display scale and refresh,
+and shared and dedicated GPU memory separately. Keep the idle and loaded samples
+separate so each result describes the conditions where it applies.
+
+On Windows, time from process creation and match the native window and displayed frames
+to that PID. Sample a small region of the visible app to identify the expected controls
+and stable layout. A window handle marks window creation. PresentMon can identify frame
+presentation and display timing where available. Use the pixel observation to decide when
+the sign-in or restore view is usable. Verify the picked adapter in Serein's startup output
+or Graphics settings. Run the minimal window on the same adapter and display. Use an
+offline, signed-out Windows test session with its own app data and credential namespace.
+[Windows GPU selection](platform-support.md#build-and-runtime-support)
+
+### Launch and input timing
+
 The repeat and first-run window rows use ordinary packaged no-account launches so
 external credential or Discord timing cannot move those budgets. First-run uses a new
-profile, empty OS credential namespace and a fresh driver cache. Repeat uses an
-initialized profile and reused driver cache. Track disk and OS page-cache conditions
-separately. Repeat the presentation
-tests during a delayed saved-login restore, with empty and populated history as separate
-fixture cohorts. Exercise cold tray with both credential states, with the renderer absent,
-and time its first Show with the session both pending and ready. The resident row begins
+profile and empty OS credential namespace. Repeat uses an initialized profile and a
+reused driver cache. Record driver-cache warmth separately from the app profile and
+the OS page cache. Match these conditions across builds. Repeat the presentation tests
+during a delayed saved-login restore, with empty and populated history as separate fixture
+cohorts. Exercise cold tray with both credential states, with the renderer absent, and
+time its first Show with the session both pending and ready. The resident row begins
 with a parked window and existing renderer. A missing tray host exercises the foreground
 fallback and has its own results.
 
