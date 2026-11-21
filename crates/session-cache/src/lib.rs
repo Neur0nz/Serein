@@ -148,6 +148,9 @@ impl Timeline {
 	pub fn row_ids(&self) -> impl DoubleEndedIterator<Item = Id> {
 		self.messages.keys().copied()
 	}
+	pub fn contains_row(&self, id: Id) -> bool {
+		self.messages.contains_key(&id)
+	}
 	/// Capacity eviction removed rows that an exhausted history page had covered.
 	pub fn older_evicted(&self) -> bool {
 		self.older_evicted
@@ -477,6 +480,12 @@ impl Timeline {
 			self.patch_bytes -= patch_bytes(&old);
 		}
 		Ok(())
+	}
+	/// Undo a local optimistic deletion that failed on the wire, clearing its tombstone
+	/// and re-inserting the captured message snapshot.
+	pub fn restore_optimistic_delete(&mut self, message: Message) -> Result<(), &'static str> {
+		self.deleted.remove(&message.id);
+		self.insert(message, true, false)
 	}
 	pub fn clear(&mut self) {
 		*self = Self::default();
@@ -1716,5 +1725,12 @@ mod tests {
 		t.seed_cache(vec![message(1), message(2)]).unwrap();
 		t.finish_page(vec![message(2)], false).unwrap();
 		assert!(t.get(Id(1)).is_none());
+		let snap = t.get(Id(2)).unwrap().clone();
+		t.delete(Id(2)).unwrap();
+		assert!(t.is_deleted(Id(2)));
+		assert!(t.get(Id(2)).is_none());
+		t.restore_optimistic_delete(snap).unwrap();
+		assert!(!t.is_deleted(Id(2)));
+		assert_eq!(t.get(Id(2)).unwrap().content, "before");
 	}
 }

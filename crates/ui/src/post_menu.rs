@@ -564,12 +564,19 @@ impl PostMenu {
 								state.request_channel_action(editor.channel, action)
 							{
 								commands.push(command);
-								editor.submitted = true;
+								if editor.delete {
+									editor.submitted = true;
+								} else {
+									close = true;
+								}
+							} else if !editor.delete {
+								// Coalesced onto an in-flight rename or unchanged.
+								close = true;
 							}
 						}
 					},
 				);
-				close =
+				close |=
 					dialog::action(ui, "post-menu-show-cancel", dialog::Action::Neutral).clicked();
 			});
 		});

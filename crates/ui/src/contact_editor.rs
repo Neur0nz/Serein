@@ -13,7 +13,11 @@ pub(super) struct ContactEditor {
 impl ContactEditor {
 	pub fn open(&mut self, user: User, nickname: bool, state: &mut State) -> Option<Command> {
 		self.draft = if nickname {
-			state.friend_nickname(user.id).unwrap_or("").to_owned()
+			state
+				.failed_contact_edit(user.id, true)
+				.or_else(|| state.friend_nickname(user.id))
+				.unwrap_or("")
+				.to_owned()
 		} else {
 			String::new()
 		};
@@ -36,12 +40,16 @@ impl ContactEditor {
 		let Some(user) = &self.user else {
 			return;
 		};
-		let busy = state.user_action_pending();
+		let loading = !self.nickname && state.user_note_loading(user.id);
 		if !self.loaded
-			&& !busy && state.user_action_status().is_none()
+			&& !loading
+			&& state.user_action_status().is_none()
 			&& let Some(note) = state.user_note(user.id)
 		{
-			self.draft = note.to_owned();
+			self.draft = state
+				.failed_contact_edit(user.id, false)
+				.unwrap_or(note)
+				.to_owned();
 			self.loaded = true;
 		}
 		let mut close = false;
@@ -71,7 +79,7 @@ impl ContactEditor {
 				let colors = crate::design::palette(ui);
 				ui.label(crate::design::semibold(ui, &user.name, 15.0).color(colors.text_strong));
 				if !self.loaded {
-					if busy {
+					if loading {
 						pending_note(ui);
 					} else {
 						crate::dialog::notice(
@@ -98,30 +106,25 @@ impl ContactEditor {
 							"contact-editor-show-note"
 						},
 					);
-					ui.add_enabled_ui(!busy, |ui| {
-						let edit = if self.nickname {
-							egui::TextEdit::singleline(&mut self.draft)
-								.align(egui::Align2::LEFT_CENTER)
-						} else {
-							egui::TextEdit::multiline(&mut self.draft).desired_rows(5)
-						};
-						crate::dialog::input(
-							ui,
-							edit.char_limit(limit)
-								.hint_text(crate::i18n::translate_if_key(
-									&(if self.nickname {
-										crate::i18n::translate(
-											"contact-editor-show-enter-a-nickname",
-										)
-									} else {
-										crate::i18n::translate(
-											"contact-editor-show-add-something-to-remember",
-										)
-									}),
-								)),
-						)
-						.labelled_by(label.id);
-					});
+					let edit = if self.nickname {
+						egui::TextEdit::singleline(&mut self.draft).align(egui::Align2::LEFT_CENTER)
+					} else {
+						egui::TextEdit::multiline(&mut self.draft).desired_rows(5)
+					};
+					crate::dialog::input(
+						ui,
+						edit.char_limit(limit)
+							.hint_text(crate::i18n::translate_if_key(
+								&(if self.nickname {
+									crate::i18n::translate("contact-editor-show-enter-a-nickname")
+								} else {
+									crate::i18n::translate(
+										"contact-editor-show-add-something-to-remember",
+									)
+								}),
+							)),
+					)
+					.labelled_by(label.id);
 					crate::dialog::hint(
 						ui,
 						&format!(
@@ -142,7 +145,7 @@ impl ContactEditor {
 					);
 					if !self.nickname
 						&& ui
-							.add_enabled_ui(!busy, |ui| {
+							.add_enabled_ui(!loading, |ui| {
 								crate::dialog::action(
 									ui,
 									"contact-editor-show-reload-saved-note",
@@ -165,15 +168,16 @@ impl ContactEditor {
 					state.user_note(user.id).unwrap_or("")
 				};
 				ui.add_enabled_ui(
-					self.loaded && ready && valid && !busy && saved != self.draft,
+					self.loaded
+						&& ready && valid && !loading
+						&& saved != self.draft
+						&& (state.demo
+							|| (state.gateway_connected
+								&& state.auth == client_core::auth::AuthState::Authenticated)),
 					|ui| {
 						if crate::dialog::action(
 							ui,
-							if busy {
-								"contact-editor-show-saving"
-							} else {
-								"contact-editor-show-save"
-							},
+							"contact-editor-show-save",
 							crate::dialog::Action::Primary,
 						)
 						.clicked()
@@ -185,21 +189,35 @@ impl ContactEditor {
 							};
 							if let Some(command) = command {
 								commands.push(command);
+								close = true;
+							} else {
+								// The latest value may have coalesced without emitting a command.
+								let staged = if self.nickname {
+									state.friend_nickname(user.id)
+								} else {
+									state.user_note(user.id)
+								};
+								close = staged.unwrap_or("") == self.draft;
 							}
 						}
 					},
 				);
-				ui.add_enabled_ui(!busy, |ui| {
-					close |= crate::dialog::action(
-						ui,
-						"contact-editor-show-cancel",
-						crate::dialog::Action::Neutral,
-					)
-					.clicked();
-				});
+				if crate::dialog::action(
+					ui,
+					"contact-editor-show-cancel",
+					crate::dialog::Action::Neutral,
+				)
+				.clicked()
+				{
+					state.discard_failed_contact_edit(user.id, self.nickname);
+					close = true;
+				}
 			});
 		});
-		if close || (!state.user_action_pending() && response.close) {
+		if response.close {
+			state.discard_failed_contact_edit(user.id, self.nickname);
+		}
+		if close || response.close {
 			*self = Self::default();
 		}
 	}

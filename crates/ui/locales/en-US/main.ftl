@@ -5220,3 +5220,15 @@ native-login-web-open = Open Discord's login page
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = This plugin has nothing to show yet.
+
+# Optimistic write feedback
+action-write-failed = { $action } failed. { $reason }
+action-write-failed-for = { $action } failed for { $target }. { $reason }
+action-write-forward-note = Send forwarding note
+action-write-poll = Poll
+action-write-forbidden = Permission denied.
+action-write-rate-limited = Wait a moment before trying again.
+action-write-network = Connection failed.
+action-write-ambiguous = The result is unknown. Check Discord before retrying.
+action-write-busy = Too many changes are pending. Try again in a moment.
+action-write-rejected = Discord rejected the change or returned an unexpected response.

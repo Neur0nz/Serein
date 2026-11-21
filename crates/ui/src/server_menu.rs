@@ -531,6 +531,7 @@ impl ServerMenu {
 		});
 		if leave && let Some(command) = state.leave_server(guild) {
 			commands.push(command);
+			close = true;
 		}
 		self.dialog = if close || response.close {
 			None

@@ -395,7 +395,7 @@ impl crate::MessagingUi {
 			&& state.can_open_user_dm(&pending.user)
 		{
 			self.complete_user_direct(state, pending, channel, commands);
-		} else if scope_matches && !adopted && state.user_action_pending() {
+		} else if scope_matches && !adopted && state.dm_open_pending() {
 			self.user_direct = Some(pending);
 		} else {
 			self.profile.finish_message(pending.user.id, false);

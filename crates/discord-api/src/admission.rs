@@ -469,4 +469,142 @@ mod tests {
 		let state = admission.state.lock().unwrap();
 		assert!(state.routes.len() <= MAX_ENTRIES && state.slots.len() <= MAX_ENTRIES);
 	}
+
+	#[tokio::test]
+	async fn pre_wire_cancel_aborts_admission_wait_without_touching_network() {
+		let mut api = DiscordApi::new(Arc::new(
+			SessionSecret::from_owner_input("SYNTHETIC_SECRET_MARKER".into()).unwrap(),
+		))
+		.unwrap();
+		// Unreachable loopback port guarantees any accidental wire dispatch fails instead of cancelling.
+		api.base = "http://127.0.0.1:9".into();
+		let held = api
+			.admission
+			.acquire(&Method::DELETE, "/channels/1/messages/2", false)
+			.await
+			.unwrap();
+		let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+		let fut = api.execute_background_write(
+			client_core::Command::Delete {
+				channel: model::Id(1),
+				message: model::Id(2),
+				request: 7,
+			},
+			Some(cancel_rx),
+			Instant::now() + Duration::from_secs(25),
+		);
+		tokio::pin!(fut);
+		assert!(pending(fut.as_mut()).await);
+		assert_eq!(api.requests.available_permits(), crate::REST_PERMITS);
+		let _ = cancel_tx.send(true);
+		assert!(matches!(fut.await, crate::WriteOutcome::Cancelled));
+		drop(held);
+		assert!(
+			api.admission
+				.acquire(&Method::DELETE, "/channels/1/messages/2", true)
+				.await
+				.is_ok()
+		);
+	}
+
+	async fn accept_request(
+		listener: &tokio::net::TcpListener,
+		expected: &str,
+	) -> tokio::net::TcpStream {
+		use tokio::io::AsyncReadExt as _;
+		let (mut socket, _) = listener.accept().await.unwrap();
+		let mut headers = Vec::new();
+		while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+			let mut chunk = [0; 512];
+			let len = socket.read(&mut chunk).await.unwrap();
+			assert!(len > 0 && headers.len() < 4096);
+			headers.extend_from_slice(&chunk[..len]);
+		}
+		assert!(headers.starts_with(expected.as_bytes()));
+		socket
+	}
+
+	#[tokio::test]
+	async fn background_deadline_does_not_abort_dispatched_request() {
+		use tokio::io::AsyncWriteExt as _;
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let mut api = DiscordApi::new(Arc::new(
+			SessionSecret::from_owner_input("SYNTHETIC_SECRET_MARKER".into()).unwrap(),
+		))
+		.unwrap();
+		api.base = format!("http://{}", listener.local_addr().unwrap());
+		let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+		let mut task = tokio::spawn(async move {
+			api.execute_background_write(
+				client_core::Command::Delete {
+					channel: model::Id(1),
+					message: model::Id(2),
+					request: 7,
+				},
+				Some(cancel_rx),
+				Instant::now() + Duration::from_secs(5),
+			)
+			.await
+		});
+		let mut socket = tokio::select! {
+			socket = accept_request(&listener, "DELETE /channels/1/messages/2 ") => socket,
+			_ = &mut task => panic!("write finished before dispatch"),
+		};
+		tokio::time::pause();
+		tokio::time::advance(Duration::from_secs(6)).await;
+		tokio::time::resume();
+		cancel_tx.send(true).unwrap();
+		socket
+			.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+		assert!(matches!(
+			task.await.unwrap(),
+			crate::WriteOutcome::Event(event)
+				if matches!(*event, client_core::Event::Deleted { result: Ok(()), .. })
+		));
+	}
+
+	#[tokio::test]
+	async fn preflight_read_preserves_cancellation_before_patch() {
+		use tokio::io::AsyncWriteExt as _;
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let mut api = DiscordApi::new(Arc::new(
+			SessionSecret::from_owner_input("SYNTHETIC_SECRET_MARKER".into()).unwrap(),
+		))
+		.unwrap();
+		api.base = format!("http://{}", listener.local_addr().unwrap());
+		let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+		let mut task = tokio::spawn(async move {
+			api.execute_background_write(
+				client_core::Command::MessagingPermissions {
+					request: 7,
+					change: Some(model::messaging_permissions::Change::DefaultAllowDms(false)),
+				},
+				Some(cancel_rx),
+				Instant::now() + Duration::from_secs(25),
+			)
+			.await
+		});
+		let mut socket = tokio::select! {
+			socket = accept_request(&listener, "GET /users/@me/settings-proto/1 ") => socket,
+			_ = &mut task => panic!("request finished before the settings read"),
+		};
+		cancel_tx.send(true).unwrap();
+		let body = r#"{"settings":"CgIYBw=="}"#;
+		socket
+			.write_all(
+				format!(
+					"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+					body.len()
+				)
+				.as_bytes(),
+			)
+			.await
+			.unwrap();
+		tokio::select! {
+			result = task => assert!(matches!(result.unwrap(), crate::WriteOutcome::Cancelled)),
+			_ = listener.accept() => panic!("superseded PATCH reached the service"),
+		}
+	}
 }

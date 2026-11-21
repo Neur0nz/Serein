@@ -972,7 +972,8 @@ fn message_deletion_uses_manage_messages_without_granting_edit_or_requiring_send
 			state.prepare_delete(Id(20), Id(101)),
 			Some(Command::Delete {
 				channel: Id(20),
-				message: Id(101)
+				message: Id(101),
+				..
 			})
 		));
 		assert!(!state.can_delete(Id(21), Id(101)));
@@ -1821,6 +1822,209 @@ fn optimistic_edits_and_pins_roll_back_without_overwriting_newer_content() {
 		Err(crate::auth::Failure::Forbidden),
 	);
 	assert!(!state.is_pinned(Id(20), Id(100)));
+}
+
+#[test]
+fn pending_delete_is_cacheable_until_gateway_confirms_it() {
+	let channel = Id(20);
+	let message = Id(100);
+	let mut state = state();
+	let Some(Command::Delete { request, .. }) = state.prepare_delete(channel, message) else {
+		panic!("own message can be deleted");
+	};
+	assert!(state.timeline.get(message).is_none());
+	assert!(
+		state
+			.confirmed_history_messages()
+			.any(|row| row.id == message)
+	);
+
+	apply(
+		&mut state,
+		Event::DeleteBulk {
+			channel,
+			ids: vec![message],
+		},
+	);
+	state.apply_delete_result(
+		channel,
+		message,
+		request,
+		Err(crate::auth::Failure::Ambiguous),
+	);
+	assert!(state.timeline.is_deleted(message));
+	assert!(
+		!state
+			.confirmed_history_messages()
+			.any(|row| row.id == message)
+	);
+	assert!(state.take_action_errors().is_empty());
+}
+
+#[test]
+fn earlier_gateway_echo_preserves_the_latest_edit_and_confirmed_cache_projection() {
+	let channel = Id(20);
+	let id = Id(100);
+	let mut state = state();
+	let original = state.timeline.get(id).unwrap().content.clone();
+	let Some(Command::Edit { request, .. }) = state.prepare_edit(channel, id, "First".into())
+	else {
+		panic!("first edit should dispatch");
+	};
+	assert!(matches!(
+		state.prepare_edit(channel, id, "Second".into()),
+		Some(Command::CancelPendingWrite { .. })
+	));
+	assert_eq!(
+		state.confirmed_history_messages().next().unwrap().content,
+		original
+	);
+
+	let mut first = message(id.0, channel);
+	first.content = "First".into();
+	first.edited = true;
+	first.edited_at = Some(1);
+	let mut first_echo = crate::message_actions::content_patch(channel, id, first.content.clone());
+	first_echo.edited = Patch::Value(1);
+	state.apply_edit_result(channel, id, request, Ok(first));
+	let Some(Command::Edit { request, .. }) = state.take_follow_up_commands().into_iter().next()
+	else {
+		panic!("second edit should dispatch");
+	};
+	apply(&mut state, Event::Patch(first_echo));
+	assert_eq!(state.timeline.get(id).unwrap().content, "Second");
+	assert_eq!(
+		state.confirmed_history_messages().next().unwrap().content,
+		"First"
+	);
+
+	let mut second = message(id.0, channel);
+	second.content = "Second".into();
+	second.edited = true;
+	second.edited_at = Some(2);
+	state.apply_edit_result(channel, id, request, Ok(second));
+	assert_eq!(state.timeline.get(id).unwrap().edited_at, Some(2));
+	assert_eq!(
+		state.confirmed_history_messages().next().unwrap().content,
+		"Second"
+	);
+}
+
+fn poll_message(id: Id, channel: Id) -> Message {
+	let mut source = message(id.0, channel);
+	source.poll = Some(Box::new(
+		model::polls::Create {
+			question: "Synthetic poll".into(),
+			answers: ["One", "Two"]
+				.into_iter()
+				.map(|text| model::polls::Media {
+					text: text.into(),
+					emoji: None,
+				})
+				.collect(),
+			duration: 1,
+			multiselect: false,
+		}
+		.fixture(crate::polls::now_ms()),
+	));
+	source.extra_content.poll = true;
+	source
+}
+
+#[test]
+fn failed_poll_vote_is_reconciled_after_leaving_its_conversation() {
+	let channel = Id(20);
+	let id = Id(100);
+	let mut state = state();
+	apply(&mut state, Event::Message(poll_message(id, channel)));
+	let Some(Command::Polls(vote)) =
+		state.prepare_poll(Some(id), crate::polls::Action::Vote(vec![1]))
+	else {
+		panic!("vote should dispatch");
+	};
+	let _ = state.select(Id(30));
+	assert_eq!(state.selected, Some(Id(30)));
+	assert!(state.polls.has_fast_pending());
+	apply(
+		&mut state,
+		Event::Polls(crate::polls::Event::Result {
+			channel,
+			message: Some(id),
+			request: vote.request,
+			result: Err(crate::auth::Failure::Forbidden),
+		}),
+	);
+	assert!(!state.polls.has_fast_pending());
+	assert_eq!(state.take_action_errors().len(), 1);
+	assert!(matches!(
+		state.select(channel),
+		Some(Command::History { .. })
+	));
+}
+
+#[test]
+fn failed_poll_vote_does_not_restore_an_open_poll_after_finalization() {
+	let channel = Id(20);
+	let id = Id(100);
+	let mut state = state();
+	let mut source = poll_message(id, channel);
+	apply(&mut state, Event::Message(source.clone()));
+	let Some(Command::Polls(vote)) =
+		state.prepare_poll(Some(id), crate::polls::Action::Vote(vec![1]))
+	else {
+		panic!("vote should dispatch");
+	};
+	let poll = source.poll.as_mut().unwrap();
+	poll.finalized = true;
+	poll.answers[0].votes = 3;
+	apply(&mut state, Event::Message(source));
+	apply(
+		&mut state,
+		Event::Polls(crate::polls::Event::Result {
+			channel,
+			message: Some(id),
+			request: vote.request,
+			result: Err(crate::auth::Failure::Forbidden),
+		}),
+	);
+	let poll = state.timeline.get(id).unwrap().poll.as_ref().unwrap();
+	assert!(poll.finalized);
+	assert_eq!(poll.answers[0].votes, 3);
+}
+
+#[test]
+fn bulk_reads_wait_for_overlapping_coalesced_channel_intent() {
+	let mut state = state();
+	let guild = Id(10);
+	let channel = Id(20);
+	let message = Id(100);
+	state
+		.apply_read_state(crate::read_state::Event::Snapshot {
+			entries: Some(vec![(channel, Some(Id(1)), 0)]),
+			version: None,
+			partial: false,
+		})
+		.unwrap();
+	let Some(Command::MarkRead { request, .. }) = state.prepare_mark_read(message) else {
+		panic!("first acknowledgement should dispatch");
+	};
+	assert!(matches!(
+		state.prepare_mark_unread(message),
+		Some(Command::CancelPendingWrite { .. })
+	));
+	assert!(state.prepare_mark_guild_read(guild).is_none());
+	assert!(state.prepare_mark_guilds_read(&[guild]).is_none());
+	assert!(state.prepare_mark_all_read().is_none());
+
+	state.apply_write_cancelled(crate::optimistic::WriteKind::ReadState, request);
+	assert!(matches!(
+		state.take_follow_up_commands().as_slice(),
+		[Command::MarkRead { manual: true, .. }]
+	));
+	assert!(matches!(
+		state.prepare_mark_guild_read(guild),
+		Some(Command::MarkGuildRead { .. })
+	));
 }
 
 #[test]

@@ -34,6 +34,7 @@ impl DiscordApi {
 		if !settings.valid() {
 			return Err(Failure::Protocol);
 		}
+		let _settings = self.account_settings_write().await?;
 		let current = self.read_guild_folders().await?;
 		if current.settings.folders != base.folders {
 			return Err(Failure::ProtocolAt(

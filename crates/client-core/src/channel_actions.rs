@@ -1,7 +1,9 @@
-//! One deliberate channel operation at a time; Discord remains authoritative.
+//! Bounded channel actions: coalesced personal/post toggles and serialized admin operations.
+use crate::optimistic::ActionKind;
 use crate::{
 	Command, State,
 	auth::{AuthState, Failure},
+	optimistic::{Cancelled, CoalescedSlot, Finish, SetOutcome, WriteKind},
 };
 use model::{
 	Id, Patch,
@@ -9,9 +11,13 @@ use model::{
 		CREATE_PUBLIC_THREADS, MANAGE_CHANNELS, MANAGE_ROLES, MANAGE_THREADS, VIEW_CHANNEL,
 	},
 };
+use std::collections::BTreeMap;
 
 const MAX_CHANNEL_REFERENCE_NAMES: usize = 64;
 const MAX_CHANNEL_REFERENCE_NAME_BYTES: usize = 8 * 1024;
+const MAX_FAST_CHANNEL_ACTIONS: usize = 32;
+/// High bit separating coalesced fast channel action sequence IDs from serialized admin actions.
+pub const FAST_REQUEST_BIT: u64 = 1 << 62;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Edit {
@@ -273,10 +279,69 @@ pub enum Event {
 		result: Result<Outcome, Failure>,
 	},
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FastChannelKey {
+	ChannelMute(Id),
+	ChannelLevel(Id),
+	HideMuted(Id),
+	PostFollow(Id),
+	PostArchive(Id),
+	PostLock(Id),
+	PostPin(Id),
+	PostRename(Id),
+	PostMute(Id),
+	PostLevel(Id),
+}
+impl FastChannelKey {
+	fn channel(self) -> Option<Id> {
+		match self {
+			Self::ChannelMute(id)
+			| Self::ChannelLevel(id)
+			| Self::PostFollow(id)
+			| Self::PostArchive(id)
+			| Self::PostLock(id)
+			| Self::PostPin(id)
+			| Self::PostRename(id)
+			| Self::PostMute(id)
+			| Self::PostLevel(id) => Some(id),
+			Self::HideMuted(_) => None,
+		}
+	}
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FastChannelValue {
+	Mute(Mute),
+	Level(u8),
+	Bool(bool),
+	Name(String),
+}
+struct FastChannelMeta {
+	guild: Id,
+	channel: Id,
+	observed: bool,
+	label: String,
+}
+fn fast_action_from_kv(key: FastChannelKey, value: FastChannelValue) -> Action {
+	match (key, value) {
+		(FastChannelKey::ChannelMute(_), FastChannelValue::Mute(m)) => Action::Mute(m),
+		(FastChannelKey::ChannelLevel(_), FastChannelValue::Level(l)) => Action::Notifications(l),
+		(FastChannelKey::HideMuted(_), FastChannelValue::Bool(b)) => Action::HideMuted(b),
+		(FastChannelKey::PostFollow(_), FastChannelValue::Bool(b)) => Action::PostFollow(b),
+		(FastChannelKey::PostArchive(_), FastChannelValue::Bool(b)) => Action::PostArchive(b),
+		(FastChannelKey::PostLock(_), FastChannelValue::Bool(b)) => Action::PostLock(b),
+		(FastChannelKey::PostPin(_), FastChannelValue::Bool(b)) => Action::PostPin(b),
+		(FastChannelKey::PostRename(_), FastChannelValue::Name(n)) => Action::PostRename(n),
+		(FastChannelKey::PostMute(_), FastChannelValue::Mute(m)) => Action::PostMute(m),
+		(FastChannelKey::PostLevel(_), FastChannelValue::Level(l)) => Action::PostNotifications(l),
+		_ => unreachable!("mismatched FastChannelKey/FastChannelValue"),
+	}
+}
 #[derive(Default)]
 pub struct Actions {
 	sequence: u64,
 	pending: Option<(Id, Id, u64, Action, bool)>,
+	fast: CoalescedSlot<FastChannelKey, FastChannelValue, MAX_FAST_CHANNEL_ACTIONS>,
+	fast_meta: BTreeMap<FastChannelKey, FastChannelMeta>,
 	details: Option<(Id, Edit)>,
 	post: Option<(Id, PostDetails)>,
 	/// The loaded post's owner. A thread's owner never changes, so this survives the live
@@ -287,10 +352,42 @@ pub struct Actions {
 }
 impl Actions {
 	pub(crate) fn reset(&mut self) {
+		let mut fast = std::mem::take(&mut self.fast);
+		let _ = fast.cancel_all();
 		*self = Self {
 			sequence: self.sequence,
+			fast,
 			..Self::default()
 		};
+	}
+	pub(crate) fn has_fast_pending(&self) -> bool {
+		self.pending.is_some() || !self.fast.is_empty()
+	}
+	pub(crate) fn optimistic_channel_mute(&self, channel: Id) -> Option<bool> {
+		self.fast
+			.entry(&FastChannelKey::ChannelMute(channel))
+			.or_else(|| self.fast.entry(&FastChannelKey::PostMute(channel)))
+			.and_then(|e| match e.desired {
+				FastChannelValue::Mute(m) => Some(m != Mute::Unmute),
+				_ => None,
+			})
+	}
+	pub(crate) fn optimistic_channel_level(&self, channel: Id) -> Option<u8> {
+		self.fast
+			.entry(&FastChannelKey::ChannelLevel(channel))
+			.or_else(|| self.fast.entry(&FastChannelKey::PostLevel(channel)))
+			.and_then(|e| match e.desired {
+				FastChannelValue::Level(l) => Some(l),
+				_ => None,
+			})
+	}
+	pub(crate) fn optimistic_hide_muted(&self, guild: Id) -> Option<bool> {
+		self.fast
+			.entry(&FastChannelKey::HideMuted(guild))
+			.and_then(|e| match e.desired {
+				FastChannelValue::Bool(b) => Some(b),
+				_ => None,
+			})
 	}
 }
 impl State {
@@ -569,6 +666,19 @@ impl State {
 	pub fn channel_action_pending(&self) -> bool {
 		self.channel_actions.pending.is_some()
 	}
+	pub fn administrative_channel_write_pending(&self) -> bool {
+		self.channel_actions
+			.pending
+			.as_ref()
+			.is_some_and(|(_, _, _, action, _)| {
+				!matches!(action, Action::Reference | Action::Load | Action::PostLoad)
+			}) || self.channel_actions.fast.iter().any(|(key, _)| {
+			matches!(
+				key,
+				FastChannelKey::PostLock(_) | FastChannelKey::PostPin(_)
+			)
+		})
+	}
 	pub fn channel_details(&self, channel: Id) -> Option<&Edit> {
 		self.channel_actions
 			.details
@@ -597,7 +707,20 @@ impl State {
 		}
 	}
 	pub fn request_channel_action(&mut self, channel: Id, action: Action) -> Option<Command> {
-		if self.channel_action_pending() {
+		let fast = matches!(
+			action,
+			Action::Mute(_)
+				| Action::Notifications(_)
+				| Action::HideMuted(_)
+				| Action::PostFollow(_)
+				| Action::PostArchive(_)
+				| Action::PostLock(_)
+				| Action::PostPin(_)
+				| Action::PostRename(_)
+				| Action::PostMute(_)
+				| Action::PostNotifications(_)
+		);
+		if !fast && self.channel_action_pending() {
 			return None;
 		}
 		self.clear_channel_action_result(channel);
@@ -660,6 +783,9 @@ impl State {
 			));
 			return None;
 		}
+		if fast {
+			return self.request_fast_channel_action(guild, channel, action);
+		}
 		if matches!(action, Action::Delete)
 			&& (self.pending.iter().any(|p| p.channel == channel)
 				|| self
@@ -691,13 +817,6 @@ impl State {
 		if matches!(action, Action::Load) && !self.demo {
 			self.channel_actions.details = None;
 		}
-		if let Action::HideMuted(hide) = &action
-			&& let Err(status) = self.confirm_guild_hides_muted(guild, *hide)
-		{
-			self.channel_actions.status = Some((channel, status, false));
-			self.status = status;
-			return None;
-		}
 		self.channel_actions.sequence = self.channel_actions.sequence.wrapping_add(1);
 		let request = self.channel_actions.sequence;
 		self.channel_actions.pending = Some((guild, channel, request, action.clone(), false));
@@ -707,6 +826,218 @@ impl State {
 			request,
 			action,
 		})
+	}
+
+	fn apply_fast_post_visual(&mut self, key: FastChannelKey, value: &FastChannelValue) {
+		match (key, value) {
+			(FastChannelKey::PostFollow(ch), FastChannelValue::Bool(v)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.followed = *v;
+				}
+			}
+			(FastChannelKey::PostArchive(ch), FastChannelValue::Bool(v)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.archived = *v;
+				}
+			}
+			(FastChannelKey::PostLock(ch), FastChannelValue::Bool(v)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.locked = *v;
+				}
+			}
+			(FastChannelKey::PostPin(ch), FastChannelValue::Bool(v)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.pinned = *v;
+				}
+			}
+			(FastChannelKey::PostMute(ch), FastChannelValue::Mute(m)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.muted = *m != Mute::Unmute;
+					if *m == Mute::Unmute {
+						details.mute_until = None;
+					}
+				}
+			}
+			(FastChannelKey::PostLevel(ch), FastChannelValue::Level(lvl)) => {
+				if let Some((id, details)) = &mut self.channel_actions.post
+					&& *id == ch
+				{
+					details.level = *lvl;
+				}
+			}
+			(FastChannelKey::PostRename(ch), FastChannelValue::Name(name)) => {
+				if let Some(index) = self.channel_index(ch) {
+					self.channels[index].name = name.clone();
+				}
+			}
+			_ => {}
+		}
+	}
+
+	fn request_fast_channel_action(
+		&mut self,
+		guild: Id,
+		channel: Id,
+		action: Action,
+	) -> Option<Command> {
+		let label = if matches!(action, Action::HideMuted(_)) {
+			self.guild_toast_label(guild)
+		} else {
+			self.channel_toast_label(channel)
+		};
+		let (key, baseline, desired) = match &action {
+			Action::Mute(m) => {
+				let confirmed = self.confirmed_guild_channel_muted(channel).unwrap_or(false);
+				let has_timer = self
+					.notification_preferences
+					.setting(Some(guild))
+					.is_some_and(|s| s.channel_mute_until.iter().any(|(id, _)| *id == channel));
+				let base = if confirmed {
+					if has_timer {
+						Mute::For(0)
+					} else {
+						Mute::Forever
+					}
+				} else {
+					Mute::Unmute
+				};
+				(
+					FastChannelKey::ChannelMute(channel),
+					FastChannelValue::Mute(base),
+					FastChannelValue::Mute(*m),
+				)
+			}
+			Action::Notifications(lvl) => {
+				let confirmed = self
+					.confirmed_channel_notification_level(channel)
+					.unwrap_or(3);
+				(
+					FastChannelKey::ChannelLevel(channel),
+					FastChannelValue::Level(confirmed),
+					FastChannelValue::Level(*lvl),
+				)
+			}
+			Action::HideMuted(hide) => {
+				let confirmed = self.confirmed_hides_muted_channels(guild).unwrap_or(false);
+				(
+					FastChannelKey::HideMuted(guild),
+					FastChannelValue::Bool(confirmed),
+					FastChannelValue::Bool(*hide),
+				)
+			}
+			Action::PostFollow(v) => {
+				let confirmed = self.post_details(channel).is_some_and(|p| p.followed);
+				(
+					FastChannelKey::PostFollow(channel),
+					FastChannelValue::Bool(confirmed),
+					FastChannelValue::Bool(*v),
+				)
+			}
+			Action::PostArchive(v) => {
+				let confirmed = self.post_details(channel).is_some_and(|p| p.archived);
+				(
+					FastChannelKey::PostArchive(channel),
+					FastChannelValue::Bool(confirmed),
+					FastChannelValue::Bool(*v),
+				)
+			}
+			Action::PostLock(v) => {
+				let confirmed = self.post_details(channel).is_some_and(|p| p.locked);
+				(
+					FastChannelKey::PostLock(channel),
+					FastChannelValue::Bool(confirmed),
+					FastChannelValue::Bool(*v),
+				)
+			}
+			Action::PostPin(v) => {
+				let confirmed = self.post_details(channel).is_some_and(|p| p.pinned);
+				(
+					FastChannelKey::PostPin(channel),
+					FastChannelValue::Bool(confirmed),
+					FastChannelValue::Bool(*v),
+				)
+			}
+			Action::PostRename(name) => {
+				let confirmed = self
+					.channel(channel)
+					.map(|c| c.name.clone())
+					.unwrap_or_default();
+				(
+					FastChannelKey::PostRename(channel),
+					FastChannelValue::Name(confirmed),
+					FastChannelValue::Name(name.clone()),
+				)
+			}
+			Action::PostMute(m) => {
+				let confirmed = self.post_details(channel).is_some_and(|p| p.muted);
+				let base = if confirmed {
+					Mute::Forever
+				} else {
+					Mute::Unmute
+				};
+				(
+					FastChannelKey::PostMute(channel),
+					FastChannelValue::Mute(base),
+					FastChannelValue::Mute(*m),
+				)
+			}
+			Action::PostNotifications(lvl) => {
+				let confirmed = self.post_details(channel).map_or(3, |p| p.level);
+				(
+					FastChannelKey::PostLevel(channel),
+					FastChannelValue::Level(confirmed),
+					FastChannelValue::Level(*lvl),
+				)
+			}
+			_ => return None,
+		};
+		match self
+			.channel_actions
+			.fast
+			.set(key, baseline, desired.clone())
+		{
+			SetOutcome::Full => {
+				self.push_write_error(ActionKind::UpdateChannel, "", Failure::Capacity);
+				None
+			}
+			SetOutcome::Queued { cancel_in_flight } => {
+				self.apply_fast_post_visual(key, &desired);
+				self.revision = self.revision.wrapping_add(1);
+				cancel_in_flight.map(|seq| Command::CancelPendingWrite {
+					kind: WriteKind::ChannelAction,
+					request: seq | FAST_REQUEST_BIT,
+				})
+			}
+			SetOutcome::Dispatch(seq) => {
+				self.channel_actions.fast_meta.insert(
+					key,
+					FastChannelMeta {
+						guild,
+						channel,
+						observed: false,
+						label,
+					},
+				);
+				self.apply_fast_post_visual(key, &desired);
+				self.revision = self.revision.wrapping_add(1);
+				Some(Command::ChannelAction {
+					guild,
+					channel,
+					request: seq | FAST_REQUEST_BIT,
+					action,
+				})
+			}
+		}
 	}
 	/// One bounded channel read for an unloaded thread named in the open conversation.
 	pub fn request_channel_reference(&mut self, guild: Id, channel: Id) -> Option<Command> {
@@ -794,8 +1125,46 @@ impl State {
 				false,
 			));
 		}
+		let cancelled = self.channel_actions.fast.cancel_all();
+		let meta = std::mem::take(&mut self.channel_actions.fast_meta);
+		for (key, entry) in cancelled {
+			self.apply_fast_post_visual(key, &entry.confirmed);
+			if let Some(meta) = meta.get(&key) {
+				self.push_write_error(
+					ActionKind::UpdateChannel,
+					meta.label.clone(),
+					Failure::Ambiguous,
+				);
+			}
+		}
 		self.channel_actions.details = None;
 		self.channel_actions.post = None;
+	}
+	pub(crate) fn cancel_channel_action_pre_wire(&mut self, request: u64) {
+		if request & FAST_REQUEST_BIT == 0 {
+			return;
+		}
+		let raw = request & !FAST_REQUEST_BIT;
+		let Some((key, outcome)) = self.channel_actions.fast.cancelled_by_seq(raw) else {
+			return;
+		};
+		match outcome {
+			Cancelled::Stale => {}
+			Cancelled::Settled => {
+				self.channel_actions.fast_meta.remove(&key);
+				self.revision = self.revision.wrapping_add(1);
+			}
+			Cancelled::DispatchFollowUp { seq, value } => {
+				if let Some(meta) = self.channel_actions.fast_meta.get(&key) {
+					self.push_follow_up(Command::ChannelAction {
+						guild: meta.guild,
+						channel: meta.channel,
+						request: seq | FAST_REQUEST_BIT,
+						action: fast_action_from_kv(key, value),
+					});
+				}
+			}
+		}
 	}
 	pub(crate) fn observe_channel_action(&mut self, event: &crate::Event) {
 		if let Some((channel, _)) = &self.channel_actions.post {
@@ -828,6 +1197,19 @@ impl State {
 				self.channel_actions.details = None;
 			}
 		}
+		for meta in self.channel_actions.fast_meta.values_mut() {
+			meta.observed |=
+				match event {
+					crate::Event::ChannelChanged(p)
+					| crate::Event::ThreadChanged { patch: p, .. } => p.id == meta.channel,
+					crate::Event::Unavailable(id) => *id == meta.channel,
+					crate::Event::ChannelCreated(c) => c.id == meta.channel,
+					crate::Event::NotificationPreferences(
+						crate::notifications::Event::Settings { entries, .. },
+					) => entries.iter().any(|s| s.guild == Some(meta.guild)),
+					_ => false,
+				};
+		}
 		if let Some((guild, channel, _, action, changed)) = &mut self.channel_actions.pending {
 			*changed |= match event {
 				crate::Event::ChannelChanged(p) | crate::Event::ThreadChanged { patch: p, .. } => {
@@ -853,6 +1235,223 @@ impl State {
 			};
 		}
 	}
+	fn apply_fast_channel_action(
+		&mut self,
+		guild: Id,
+		channel: Id,
+		request: u64,
+		result: Result<Outcome, Failure>,
+	) -> Result<(), &'static str> {
+		let raw = request & !FAST_REQUEST_BIT;
+		let Some((key, wire_value)) = self.channel_actions.fast.iter().find_map(|(k, e)| {
+			e.in_flight
+				.as_ref()
+				.filter(|(s, _)| *s == raw)
+				.map(|(_, v)| (*k, v.clone()))
+		}) else {
+			return Ok(());
+		};
+		let action = fast_action_from_kv(key, wire_value);
+		let meta_info = self
+			.channel_actions
+			.fast_meta
+			.get(&key)
+			.map(|m| (m.guild, m.channel, m.observed, m.label.clone()));
+		let Some((meta_guild, meta_channel, observed, label)) = meta_info else {
+			return Ok(());
+		};
+		if meta_guild != guild || meta_channel != channel {
+			return Ok(());
+		}
+		let validated = result.and_then(|outcome| {
+			let valid = match (&action, &outcome) {
+				(
+					Action::PostFollow(_)
+					| Action::PostArchive(_)
+					| Action::PostLock(_)
+					| Action::PostRename(_)
+					| Action::PostPin(_)
+					| Action::PostMute(_)
+					| Action::PostNotifications(_),
+					Outcome::Post {
+						channel: target,
+						details,
+					},
+				) => {
+					target.id == channel
+						&& target.guild == Some(guild)
+						&& matches!(target.kind, 10..=12)
+						&& self
+							.channel(channel)
+							.is_some_and(|c| c.parent_id == target.parent_id)
+						&& valid_name(&target.name)
+						&& details.owner.is_none_or(|id| id.0 != 0)
+						&& details.level <= 3
+						&& match &action {
+							Action::PostFollow(value) => details.followed == *value,
+							Action::PostArchive(value) => details.archived == *value,
+							Action::PostLock(value) => details.locked == *value,
+							Action::PostPin(value) => details.pinned == *value,
+							Action::PostRename(value) => target.name == *value,
+							Action::PostMute(value) => details.muted == (*value != Mute::Unmute),
+							Action::PostNotifications(value) => details.level == *value,
+							_ => true,
+						}
+				}
+				(Action::Mute(mute), Outcome::Preferences { muted, .. }) => {
+					*muted == Some(*mute != Mute::Unmute)
+				}
+				(Action::Notifications(wanted), Outcome::Preferences { level, .. }) => {
+					*level == Some(*wanted)
+				}
+				(Action::HideMuted(hide), Outcome::HideMuted(actual)) => hide == actual,
+				_ => false,
+			};
+			if valid && outcome.bytes() <= 64 * 1024 {
+				Ok(outcome)
+			} else {
+				Err(Failure::Ambiguous)
+			}
+		});
+		let finish_unit = validated.as_ref().map(|_| ()).map_err(|f| *f);
+		match self.channel_actions.fast.finish(&key, raw, finish_unit) {
+			Finish::Stale => Ok(()),
+			Finish::RolledBack {
+				previous, failure, ..
+			} => {
+				self.channel_actions.fast_meta.remove(&key);
+				self.apply_fast_post_visual(key, &previous);
+				self.channel_actions.status = Some((channel, failure.label(), false));
+				self.revision = self.revision.wrapping_add(1);
+				if failure.ends_session() && failure != Failure::Capacity {
+					self.fail(failure);
+				} else {
+					self.push_write_error(ActionKind::UpdateChannel, label, failure);
+				}
+				Ok(())
+			}
+			Finish::Settled { .. } | Finish::DispatchFollowUp { .. } => {
+				let follow_up = self
+					.channel_actions
+					.fast
+					.entry(&key)
+					.and_then(|e| e.in_flight.as_ref().map(|(s, v)| (*s, v.clone())));
+				if follow_up.is_none() {
+					self.channel_actions.fast_meta.remove(&key);
+					let superseded = observed
+						&& matches!(
+							&action,
+							Action::PostRename(wanted)
+								if self.channel(channel).is_none_or(|c| c.name != *wanted)
+						);
+					self.channel_actions.status = Some((
+						channel,
+						if superseded {
+							"Post updated elsewhere"
+						} else {
+							"Updated"
+						},
+						!superseded,
+					));
+				}
+				if let Ok(outcome) = validated {
+					match outcome {
+						Outcome::Preferences {
+							muted,
+							level,
+							mute_until,
+						} => {
+							if self.can_view(channel) && !observed {
+								let _ = self
+									.confirm_channel_preferences(guild, channel, muted, level)
+									.and_then(|_| {
+										self.confirm_channel_mute_timer(channel, muted, mute_until)
+									});
+							}
+						}
+						Outcome::HideMuted(hide) => {
+							if !observed {
+								let _ = self.confirm_guild_hides_muted(guild, hide);
+							}
+						}
+						Outcome::Post {
+							channel: updated,
+							details,
+						} if self.is_thread_channel(channel)
+							&& self.can_view(channel)
+							&& !observed =>
+						{
+							if self
+								.channel(channel)
+								.is_some_and(|c| c.name != updated.name)
+							{
+								self.apply(crate::Envelope {
+									generation: self.generation,
+									event: crate::Event::ChannelChanged(model::ChannelPatch {
+										user_limit: Patch::Absent,
+										slowmode: Patch::Absent,
+										id: channel,
+										name: Patch::Value(updated.name.clone()),
+										icon: Patch::Absent,
+										last_message: Patch::Absent,
+										parent_id: Patch::Absent,
+										position: Patch::Absent,
+										kind: Patch::Absent,
+										message_count: Patch::Absent,
+										tags: Patch::Absent,
+									}),
+								});
+							}
+							if !details.archived && self.archived_thread == Some(channel) {
+								self.archived_thread = None;
+							}
+							let _ = self
+								.confirm_channel_preferences(
+									guild,
+									channel,
+									Some(details.muted),
+									Some(details.level),
+								)
+								.and_then(|_| {
+									self.confirm_channel_mute_timer(
+										channel,
+										Some(details.muted),
+										details.mute_until,
+									)
+								});
+							self.channel_actions.post_owner =
+								details.owner.map(|owner| (channel, owner));
+							self.channel_actions.post = Some((channel, details));
+							let remaining: Vec<(FastChannelKey, FastChannelValue)> = self
+								.channel_actions
+								.fast
+								.iter()
+								.filter(|(k, _)| k.channel() == Some(channel))
+								.map(|(k, e)| (*k, e.desired.clone()))
+								.collect();
+							for (rem_key, rem_val) in remaining {
+								self.apply_fast_post_visual(rem_key, &rem_val);
+							}
+						}
+						_ => {}
+					}
+				}
+				if let Some((seq, value)) = follow_up {
+					if let Some(meta) = self.channel_actions.fast_meta.get_mut(&key) {
+						meta.observed = false;
+					}
+					self.push_follow_up(Command::ChannelAction {
+						guild,
+						channel,
+						request: seq | FAST_REQUEST_BIT,
+						action: fast_action_from_kv(key, value),
+					});
+				}
+				self.revision = self.revision.wrapping_add(1);
+				Ok(())
+			}
+		}
+	}
 	pub(crate) fn apply_channel_action(&mut self, event: Event) -> Result<(), &'static str> {
 		let Event::Finished {
 			guild,
@@ -860,6 +1459,9 @@ impl State {
 			request,
 			result,
 		} = event;
+		if request & FAST_REQUEST_BIT != 0 {
+			return self.apply_fast_channel_action(guild, channel, request, result);
+		}
 		let Some((g, c, r, _, _)) = &self.channel_actions.pending else {
 			return Ok(());
 		};
@@ -967,7 +1569,7 @@ impl State {
 				{
 					let _ = self.confirm_guild_hides_muted(guild, !*hide);
 				}
-				if failure.ends_session() {
+				if failure.ends_session() && failure != Failure::Capacity {
 					self.fail(failure);
 				}
 				// A thread read that admitted nothing names a destination this account cannot

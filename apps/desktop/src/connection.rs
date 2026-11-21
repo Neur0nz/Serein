@@ -2,7 +2,7 @@ use client_core::{
 	COMMAND_SLOTS, Command, EVENT_SLOTS, Envelope, Event, MAX_EVENT_BYTES,
 	auth::{ExpirySlot, Failure, SessionSecret},
 };
-use discord_api::DiscordApi;
+use discord_api::{DiscordApi, WRITE_ADMISSION_EXPIRED};
 use eframe::egui;
 use std::{
 	collections::BTreeMap,
@@ -14,12 +14,13 @@ use std::{
 };
 use tokio::{
 	runtime::Handle,
-	sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+	sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
 	task::JoinHandle,
 };
 
 pub struct Connection {
-	pub commands: mpsc::Sender<Command>,
+	commands: mpsc::Sender<(Command, Option<PendingBackgroundWrite>)>,
+	background_status: Arc<Mutex<BackgroundWriteStatus>>,
 	pub uploads: mpsc::Sender<crate::uploads::UploadRequest>,
 	pub events: ReliableEvents,
 	pub typing: mpsc::Receiver<Envelope>,
@@ -195,6 +196,408 @@ impl WriteOrder {
 		Some(guard)
 	}
 }
+/// Background operations admitted to the REST adapter, including those waiting to dispatch.
+const MAX_CONCURRENT_WRITES: usize = 12;
+/// A change may wait this long for dispatch. Started HTTP requests keep their transport timeout.
+const BACKGROUND_ADMISSION_TIMEOUT: Duration = Duration::from_secs(25);
+#[derive(Default)]
+struct BackgroundWriteStatus {
+	outstanding: usize,
+	failure_revision: u64,
+}
+
+struct PendingBackgroundWrite {
+	status: Arc<Mutex<BackgroundWriteStatus>>,
+	deadline: tokio::time::Instant,
+	succeeded: bool,
+}
+
+impl PendingBackgroundWrite {
+	fn new(status: Arc<Mutex<BackgroundWriteStatus>>) -> Self {
+		status
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.outstanding += 1;
+		Self {
+			status,
+			deadline: tokio::time::Instant::now() + BACKGROUND_ADMISSION_TIMEOUT,
+			succeeded: false,
+		}
+	}
+}
+
+impl Drop for PendingBackgroundWrite {
+	fn drop(&mut self) {
+		let mut status = self
+			.status
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		status.outstanding -= 1;
+		if !self.succeeded {
+			status.failure_revision = status.failure_revision.wrapping_add(1);
+		}
+	}
+}
+
+type CancelKey = (client_core::optimistic::WriteKind, u64);
+type CancelMap = Arc<Mutex<BTreeMap<CancelKey, watch::Sender<bool>>>>;
+
+struct CancelEntryGuard {
+	map: CancelMap,
+	key: Option<CancelKey>,
+}
+
+impl Drop for CancelEntryGuard {
+	fn drop(&mut self) {
+		if let Some(key) = self.key.take()
+			&& let Ok(mut map) = self.map.lock()
+		{
+			map.remove(&key);
+		}
+	}
+}
+
+fn is_background_write(command: &Command) -> bool {
+	use client_core::{channel_actions, group_actions, polls, server_actions, user_actions};
+	matches!(
+		command,
+		Command::UserAction {
+			action: user_actions::Action::Note { .. }
+				| user_actions::Action::Nickname { .. }
+				| user_actions::Action::AddFriend { .. }
+				| user_actions::Action::ResolveFriend { .. }
+				| user_actions::Action::ProfileFriend { .. }
+				| user_actions::Action::CloseDm(_)
+				| user_actions::Action::Block { .. }
+				| user_actions::Action::Ignore { .. }
+				| user_actions::Action::Mute { .. }
+				| user_actions::Action::MessageRequest { .. },
+			..
+		} | Command::ServerAction {
+			action: server_actions::Action::Notifications { .. } | server_actions::Action::Leave(_),
+			..
+		} | Command::SendServerInvite { .. }
+			| Command::ChannelAction {
+				action: channel_actions::Action::Mute(_)
+					| channel_actions::Action::Notifications(_)
+					| channel_actions::Action::HideMuted(_)
+					| channel_actions::Action::PostFollow(_)
+					| channel_actions::Action::PostArchive(_)
+					| channel_actions::Action::PostRename(_)
+					| channel_actions::Action::PostMute(_)
+					| channel_actions::Action::PostNotifications(_),
+				..
+			} | Command::GroupAction {
+			action: group_actions::Action::Leave(_)
+				| group_actions::Action::Edit {
+					icon: model::Patch::Absent,
+					..
+				},
+			..
+		} | Command::Reactions(client_core::reactions::Command::Set { .. })
+			| Command::MarkRead { .. }
+			| Command::MarkGuildRead { .. }
+			| Command::MarkAllRead { .. }
+			| Command::Edit { .. }
+			| Command::Pin { .. }
+			| Command::Delete { .. }
+			| Command::Polls(polls::Request {
+				action: polls::Action::Vote(_),
+				..
+			}) | Command::GuildFolders {
+			change: Some(_),
+			..
+		} | Command::MessagingPermissions {
+			change: Some(_),
+			..
+		}
+	)
+}
+
+fn cancellable_write_key(command: &Command) -> Option<CancelKey> {
+	use client_core::optimistic::WriteKind;
+	match command {
+		Command::UserAction {
+			action:
+				client_core::user_actions::Action::Block { .. }
+				| client_core::user_actions::Action::Ignore { .. }
+				| client_core::user_actions::Action::Mute { .. }
+				| client_core::user_actions::Action::Note { .. }
+				| client_core::user_actions::Action::Nickname { .. },
+			request,
+			..
+		} => Some((WriteKind::UserAction, *request)),
+		Command::ServerAction {
+			action: client_core::server_actions::Action::Notifications { .. },
+			request,
+		} => Some((WriteKind::ServerAction, *request)),
+		Command::ChannelAction { request, .. }
+			if *request & client_core::channel_actions::FAST_REQUEST_BIT != 0 =>
+		{
+			Some((WriteKind::ChannelAction, *request))
+		}
+		Command::GroupAction { request, .. }
+			if *request & client_core::group_actions::RENAME_REQUEST_BIT != 0 =>
+		{
+			Some((WriteKind::GroupAction, *request))
+		}
+		Command::Reactions(client_core::reactions::Command::Set { request, .. }) => {
+			Some((WriteKind::Reaction, *request))
+		}
+		Command::MarkRead { request, .. } => Some((WriteKind::ReadState, *request)),
+		Command::Edit { request, .. } => Some((WriteKind::Edit, *request)),
+		Command::Polls(req) if matches!(req.action, client_core::polls::Action::Vote(_)) => {
+			Some((WriteKind::Poll, req.request))
+		}
+		Command::MessagingPermissions {
+			request,
+			change: Some(_),
+		} => Some((WriteKind::MessagingPermissions, *request)),
+		_ => None,
+	}
+}
+
+fn background_write_failure_event(command: &Command, failure: Failure) -> Option<Event> {
+	Some(match command {
+		Command::UserAction {
+			action, request, ..
+		} => match action {
+			client_core::user_actions::Action::OpenDm(user) => {
+				Event::UserAction(client_core::user_actions::Event::DmOpened {
+					user: *user,
+					request: *request,
+					result: Err(failure),
+				})
+			}
+			client_core::user_actions::Action::CreateGroup { recipients } => {
+				Event::UserAction(client_core::user_actions::Event::GroupCreated {
+					request: *request,
+					recipients: recipients.clone(),
+					result: Err(failure),
+				})
+			}
+			other => Event::UserAction(client_core::user_actions::Event::Written {
+				action: other.clone(),
+				request: *request,
+				result: Err(failure),
+			}),
+		},
+		Command::ServerAction { action, request } => {
+			Event::ServerAction(client_core::server_actions::Event::Written {
+				action: *action,
+				request: *request,
+				result: Err(failure),
+			})
+		}
+		Command::SendServerInvite {
+			guild,
+			user,
+			request,
+			..
+		} => Event::ServerAction(client_core::server_actions::Event::InviteSent {
+			guild: *guild,
+			user: *user,
+			request: *request,
+			result: Err(failure),
+		}),
+		Command::ChannelAction {
+			guild,
+			channel,
+			request,
+			..
+		} => Event::ChannelAction(client_core::channel_actions::Event::Finished {
+			guild: *guild,
+			channel: *channel,
+			request: *request,
+			result: Err(failure),
+		}),
+		Command::GroupAction { action, request } => {
+			Event::GroupAction(client_core::group_actions::Event::Written {
+				channel: action.channel(),
+				request: *request,
+				result: Err(failure),
+			})
+		}
+		Command::Reactions(client_core::reactions::Command::Set {
+			channel,
+			message,
+			request,
+			..
+		}) => Event::Reactions(client_core::reactions::Event::Written {
+			channel: *channel,
+			message: *message,
+			request: *request,
+			result: Err(failure),
+		}),
+		Command::MarkRead {
+			channel,
+			message,
+			request,
+			..
+		} => Event::ReadState(client_core::read_state::Event::Result {
+			channel: *channel,
+			message: *message,
+			request: *request,
+			result: Err(failure),
+		}),
+		Command::MarkGuildRead { guild, request } => {
+			Event::ReadState(client_core::read_state::Event::GuildAck {
+				guild: *guild,
+				request: *request,
+				result: Err(failure),
+			})
+		}
+		Command::MarkAllRead { request, .. } => {
+			Event::ReadState(client_core::read_state::Event::AllAck {
+				request: *request,
+				acked: 0,
+				result: Err(failure),
+			})
+		}
+		Command::Edit {
+			request,
+			channel,
+			message,
+			..
+		} => Event::Edited {
+			request: *request,
+			channel: *channel,
+			message: *message,
+			result: Err(failure),
+		},
+		Command::Pin {
+			request,
+			channel,
+			message,
+			pinned,
+		} => Event::Pinned {
+			request: *request,
+			channel: *channel,
+			message: *message,
+			pinned: *pinned,
+			result: Err(failure),
+		},
+		Command::Delete {
+			channel,
+			message,
+			request,
+		} => Event::Deleted {
+			channel: *channel,
+			message: *message,
+			request: *request,
+			result: Err(failure),
+		},
+		Command::Polls(req) => Event::Polls(client_core::polls::Event::Result {
+			channel: req.channel,
+			message: req.message,
+			request: req.request,
+			result: Err(failure),
+		}),
+		Command::GuildFolders { request, .. } => Event::GuildFolders {
+			request: *request,
+			result: Err(failure),
+		},
+		Command::MessagingPermissions { request, .. } => Event::MessagingPermissions {
+			request: *request,
+			result: Err(failure),
+		},
+		_ => return None,
+	})
+}
+
+fn write_event_failure(event: &Event) -> Option<Failure> {
+	match event {
+		Event::TypingSent(Err(f)) if f.ends_session() && *f != Failure::Capacity => Some(*f),
+		Event::Interaction(client_core::interactions::Event::Submitted {
+			result: Err(f), ..
+		}) => Some(*f),
+		Event::MessagingPermissions { result: Err(f), .. } => Some(*f),
+		Event::ChannelAction(client_core::channel_actions::Event::Finished {
+			result: Err(f),
+			..
+		}) => Some(*f),
+		Event::ServerAdmin(client_core::server_admin::Event { result: Err(f), .. }) => Some(*f),
+		Event::ServerSettings(client_core::server_settings::Event { result: Err(f), .. }) => {
+			Some(*f)
+		}
+		Event::Onboarding(
+			client_core::onboarding::Event::Loaded { result: Err(f), .. }
+			| client_core::onboarding::Event::Submitted { result: Err(f), .. },
+		) => Some(*f),
+		Event::Failure(f) => Some(*f),
+		Event::ProfileEdited { result: Err(f), .. } if *f != Failure::Capacity => Some(*f),
+		Event::Edited { result: Err(f), .. }
+		| Event::Pinned { result: Err(f), .. }
+		| Event::Deleted { result: Err(f), .. } => Some(*f),
+		Event::GuildFolders { result: Err(f), .. } => Some(*f),
+		Event::JoinInvite { result: Err(f), .. } | Event::GuildCreated { result: Err(f), .. } => {
+			Some(*f)
+		}
+		Event::SendResult { result: Err(f), .. } => Some(*f),
+		Event::UserAction(
+			client_core::user_actions::Event::Written { result: Err(f), .. }
+			| client_core::user_actions::Event::DmOpened { result: Err(f), .. }
+			| client_core::user_actions::Event::GroupCreated { result: Err(f), .. },
+		) => Some(*f),
+		Event::ServerAction(
+			client_core::server_actions::Event::Written { result: Err(f), .. }
+			| client_core::server_actions::Event::InviteSent { result: Err(f), .. },
+		) => Some(*f),
+		Event::GroupAction(client_core::group_actions::Event::Written {
+			result: Err(f), ..
+		}) => Some(*f),
+		Event::Reactions(client_core::reactions::Event::Written { result: Err(f), .. }) => Some(*f),
+		Event::ReadState(
+			client_core::read_state::Event::Result { result: Err(f), .. }
+			| client_core::read_state::Event::GuildAck { result: Err(f), .. }
+			| client_core::read_state::Event::AllAck { result: Err(f), .. },
+		) => Some(*f),
+		Event::Polls(client_core::polls::Event::Result { result: Err(f), .. }) => Some(*f),
+		_ => None,
+	}
+}
+
+async fn run_background_write(
+	api: &DiscordApi,
+	command: Command,
+	permits: &Semaphore,
+	cancel_key: Option<CancelKey>,
+	mut cancel: Option<watch::Receiver<bool>>,
+	deadline: tokio::time::Instant,
+) -> Event {
+	let not_sent = || {
+		background_write_failure_event(&command, WRITE_ADMISSION_EXPIRED)
+			.unwrap_or(Event::Failure(WRITE_ADMISSION_EXPIRED))
+	};
+	let cancelled = || match cancel_key {
+		Some((kind, request)) => Event::WriteCancelled { kind, request },
+		None => Event::Failure(WRITE_ADMISSION_EXPIRED),
+	};
+	let _permit = tokio::select! {
+		biased;
+		() = async {
+			if let Some(rx) = &mut cancel
+				&& rx.wait_for(|cancelled| *cancelled).await.is_ok()
+			{
+				return;
+			}
+			std::future::pending::<()>().await;
+		} => return cancelled(),
+		() = tokio::time::sleep_until(deadline) => return not_sent(),
+		permit = permits.acquire() => match permit {
+			Ok(permit) => permit,
+			Err(_) => return not_sent(),
+		},
+	};
+	match api
+		.execute_background_write(command, cancel, deadline)
+		.await
+	{
+		discord_api::WriteOutcome::Event(event) => *event,
+		discord_api::WriteOutcome::Cancelled => cancelled(),
+	}
+}
+
 fn reject_prefetch_at_capacity(tasks: &mut Vec<AbortTask>, command: &Command) -> Option<Event> {
 	tasks.retain(|task| !task.0.is_finished());
 	if tasks.len() < PREFETCHES {
@@ -224,6 +627,25 @@ fn reject_prefetch_at_capacity(tasks: &mut Vec<AbortTask>, command: &Command) ->
 	})
 }
 impl Connection {
+	/// Queue a command, returning it unchanged if the connection is closed or full.
+	pub fn submit(&self, command: Command) -> Option<Command> {
+		let Ok(permit) = self.commands.try_reserve() else {
+			return Some(command);
+		};
+		let background = is_background_write(&command)
+			.then(|| PendingBackgroundWrite::new(self.background_status.clone()));
+		permit.send((command, background));
+		None
+	}
+	/// Accepted writes still outstanding and the revision of failed or interrupted writes.
+	pub fn background_write_status(&self) -> (usize, u64) {
+		let status = self
+			.background_status
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		(status.outstanding, status.failure_revision)
+	}
+
 	/// Coalesce explicit recovery requests without restarting REST writes or authentication.
 	pub fn reconnect(&self) {
 		self.reconnect.notify_one();
@@ -251,7 +673,9 @@ impl Connection {
 		api_proxy: watch::Receiver<Option<discord_api::proxy::ApiProxy>>,
 		ctx: egui::Context,
 	) -> Self {
-		let (commands, mut receive) = mpsc::channel(COMMAND_SLOTS);
+		let (commands, mut receive) =
+			mpsc::channel::<(Command, Option<PendingBackgroundWrite>)>(COMMAND_SLOTS);
+		let background_status = Arc::new(Mutex::new(BackgroundWriteStatus::default()));
 		let (uploads, mut upload_receive) = mpsc::channel::<crate::uploads::UploadRequest>(1);
 		let (send, events) = reliable_events(ctx.clone());
 		let (typing_send, typing) = mpsc::channel(8);
@@ -471,11 +895,15 @@ impl Connection {
                     while let Some((command,typing))=write_receive.recv().await {
                         let Some(_order)=writer_order.begin(typing).await else {continue;};
                         let event=write_api.execute_write(command,|nonce|{let _=write_emit(Event::SendThrottled{nonce:nonce.to_owned()});write_wake.request_repaint();}).await;
-                        let failure=match &event {Event::TypingSent(Err(f)) if f.ends_session() && *f!=Failure::Capacity=>Some(*f),Event::Interaction(client_core::interactions::Event::Submitted{result:Err(f),..})=>Some(*f),Event::MessagingPermissions{result:Err(f),..}=>Some(*f),Event::ChannelAction(client_core::channel_actions::Event::Finished{result:Err(f),..})=>Some(*f),Event::ServerAdmin(client_core::server_admin::Event{result:Err(f),..})=>Some(*f),Event::ServerSettings(client_core::server_settings::Event{result:Err(f),..})=>Some(*f),Event::Onboarding(client_core::onboarding::Event::Loaded{result:Err(f),..}|client_core::onboarding::Event::Submitted{result:Err(f),..})=>Some(*f),Event::Failure(f)=>Some(*f),Event::ProfileEdited{result:Err(f),..} if *f != Failure::Capacity =>Some(*f),Event::Edited{result:Err(f),..}|Event::Pinned{result:Err(f),..}=>Some(*f),Event::GuildFolders(Err(f))=>Some(*f),Event::JoinInvite{result:Err(f),..}|Event::GuildCreated{result:Err(f),..}=>Some(*f),Event::SendResult{result:Err(f),..}=>Some(*f),Event::UserAction(client_core::user_actions::Event::Written{result:Err(f),..})=>Some(*f),Event::UserAction(client_core::user_actions::Event::DmOpened{result:Err(f),..})=>Some(*f),Event::ServerAction(client_core::server_actions::Event::Written{result:Err(f),..})=>Some(*f),Event::ServerAction(client_core::server_actions::Event::InviteSent{result:Err(f),..})=>Some(*f),Event::GroupAction(client_core::group_actions::Event::Written{result:Err(f),..})=>Some(*f),Event::Reactions(client_core::reactions::Event::Written{result:Err(f),..})=>Some(*f),Event::ReadState(client_core::read_state::Event::Result{result:Err(f),..})=>Some(*f),_=>None};
+                        let failure=write_event_failure(&event);
                         let error=write_emit(event).err().or(failure.filter(|f|f.ends_session()));
                         if let Some(error)=error {write_api.stop_with(error);publish_terminal(&write_finished, write_api.stop_reason().unwrap_or(error));write_wake.request_repaint();break;}
                     }
                 }));
+                let background_permits=Arc::new(Semaphore::new(MAX_CONCURRENT_WRITES));
+                let mut background_writes:tokio::task::JoinSet<()>=tokio::task::JoinSet::new();
+                let cancel_map:CancelMap=Arc::new(Mutex::new(BTreeMap::new()));
+				let mut previous_ack:Option<oneshot::Receiver<()>>=None;
                 let mut history:Option<AbortTask>=None;
                 // Preloads never cancel the open conversation's reads or each other; each kind
                 // keeps at most one in flight, so this list stays tiny.
@@ -506,6 +934,7 @@ impl Connection {
                         failure=api.terminal_failure()=>{return Err(failure);}
                         _=&mut gateway_task.0=>{break;}
                         _=&mut writes.0=>{break;}
+                        _=background_writes.join_next(), if !background_writes.is_empty()=>{}
                         changed=recipient_scope_changed.changed()=> {
                             if changed.is_err() {break;}
                             recipient_scope_changed.borrow_and_update();
@@ -573,7 +1002,7 @@ impl Connection {
                         command=receive.recv()=>{
                             // Select can admit a queued command before the changed-watch branch.
                             if release_taken_over(&mut voice_request,*takeover_receive.borrow()) {drop(ringing.take());drop(recipient_ringing.take());recipient_call.lock().map_err(|_|Failure::Protocol)?.active=None;}
-                            let Some(command)=command else {break;};
+                            let Some((command, background))=command else {break;};
                             // A solved attachment challenge belongs to the upload holding the staged
                             // files; the text writer would post the caption without them.
                             let command=match command {
@@ -910,6 +1339,14 @@ impl Connection {
                                 })));
                                 continue;
                             }
+                            if let Command::CancelPendingWrite { kind, request } = command {
+                                if let Ok(map) = cancel_map.lock()
+                                    && let Some(tx) = map.get(&(kind, request))
+                                {
+                                    let _ = tx.send(true);
+                                }
+                                continue;
+                            }
                             if let Command::History { channel, request, .. } = &command {
                                 drop(search.take());
                                 drop(reaction_read.take());
@@ -922,6 +1359,57 @@ impl Connection {
                                     if let Err(f)=emit(event){api.stop_with(f);publish_terminal(&finished, api.stop_reason().unwrap_or(f));}
                                     history_wake.request_repaint();
                                 })));
+                            } else if let Some(mut background) = background {
+                                if background_writes.len() >= MAX_CONCURRENT_WRITES + COMMAND_SLOTS {
+                                    if let Some(event) = background_write_failure_event(&command, Failure::ProtocolAt("Background write queue is full. The change was not sent.")) {
+                                        emit(event)?;
+                                        wake.request_repaint();
+                                    }
+                                    continue;
+                                }
+                                let cancel_key = cancellable_write_key(&command);
+                                let cancel = cancel_key.and_then(|key| {
+                                    let (tx, rx) = watch::channel(false);
+                                    cancel_map.lock().ok()?.insert(key, tx);
+                                    Some(rx)
+                                });
+                                let cancel_guard = CancelEntryGuard {
+                                    map: cancel_map.clone(),
+                                    key: cancel_key,
+                                };
+                                // Bulk and per-channel acknowledgements can overlap the same read
+                                // marker even when their REST routes are unrelated. Keep their order.
+                                let ack_turn = matches!(command, Command::MarkRead { .. } | Command::MarkGuildRead { .. } | Command::MarkAllRead { .. }).then(|| {
+                                    let (complete, next) = oneshot::channel();
+                                    (previous_ack.replace(next), complete)
+                                });
+                                let permits = background_permits.clone();
+                                let api = api.clone();
+                                let emit = emit.clone();
+                                let finished = finished.clone();
+                                let bg_wake = wake.clone();
+                                background_writes.spawn(async move {
+                                    let _guard = cancel_guard;
+                                    let _ack_complete = if let Some((prior, complete)) = ack_turn {
+                                        if let Some(prior) = prior {
+                                            let _ = prior.await;
+                                        }
+                                        Some(complete)
+                                    } else {
+                                        None
+                                    };
+                                    let event = run_background_write(&api, command, &permits, cancel_key, cancel, background.deadline).await;
+                                    let failure = write_event_failure(&event);
+                                    let emitted = emit(event);
+                                    background.succeeded = failure.is_none() && emitted.is_ok();
+                                    drop(background);
+                                    let error = emitted.err().or(failure.filter(|f| f.ends_session() && *f != Failure::Capacity));
+                                    if let Some(error) = error {
+                                        api.stop_with(error);
+                                        publish_terminal(&finished, api.stop_reason().unwrap_or(error));
+                                    }
+                                    bg_wake.request_repaint();
+                                });
                             } else {
                                 if matches!(command,Command::Send{..}) {write_order.invalidate_typing();}
                                 write_send.try_send((command,None)).map_err(|_|Failure::Capacity)?;
@@ -935,6 +1423,7 @@ impl Connection {
         });
 		Self {
 			commands,
+			background_status,
 			uploads,
 			events,
 			typing,

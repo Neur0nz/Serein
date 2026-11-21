@@ -8,7 +8,7 @@ pub const MAX_NAME_BYTES: usize = 400;
 pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_HEAP_BYTES: usize = 128 * 1024;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Folder {
 	pub id: Option<u64>,
 	pub guild_ids: Vec<Id>,
@@ -16,7 +16,7 @@ pub struct Folder {
 	pub color: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
 	pub folders: Vec<Folder>,
 	pub version: u64,

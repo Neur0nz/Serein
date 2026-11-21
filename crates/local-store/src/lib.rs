@@ -10,9 +10,15 @@ use std::{
 };
 
 const MAX_MEDIA_JSON: usize = 256 * 1024;
+// Also accepts the bounded JSON written by earlier builds of the startup shell.
+const MAX_STARTUP_SELECTION_JSON: usize = 512 * 1024;
 const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
-const NATIVE_SCHEMA: u32 = 29;
-const READABLE_SCHEMA: u32 = 29;
+const NATIVE_SCHEMA: u32 = 30;
+const READABLE_SCHEMA: u32 = 30;
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StartupSelection {
+	selected_channel: Option<Id>,
+}
 #[derive(serde::Deserialize)]
 struct CachedMentions(#[serde(deserialize_with = "model::deserialize_mentions")] Vec<User>);
 fn parse_author_roles(raw: &str) -> std::result::Result<Vec<Id>, StoreError> {
@@ -540,6 +546,11 @@ impl LocalStore {
                 discriminator INTEGER NOT NULL CHECK(typeof(discriminator)='integer' AND discriminator BETWEEN 0 AND 9999),
                 touched INTEGER NOT NULL CHECK(typeof(touched)='integer'),
                 has_token INTEGER NOT NULL DEFAULT 0 CHECK(typeof(has_token)='integer' AND has_token IN (0,1))
+            );
+            CREATE TABLE IF NOT EXISTS startup_snapshot(
+                account TEXT PRIMARY KEY NOT NULL,
+                updated INTEGER NOT NULL CHECK(typeof(updated)='integer'),
+                value TEXT NOT NULL CHECK(typeof(value)='text' AND length(CAST(value AS BLOB))<=524288)
             );")?;
 		let has_token_column: bool = transaction.query_row(
 			"SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name='has_token')",
@@ -1511,9 +1522,54 @@ impl LocalStore {
 			"DELETE FROM history_starts WHERE account=?1",
 			[account.to_string()],
 		)?;
+		transaction.execute(
+			"DELETE FROM startup_snapshot WHERE account=?1",
+			[account.to_string()],
+		)?;
 		transaction.commit()?;
 		self.0
 			.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(64);")?;
+		Ok(())
+	}
+	/// Restores the last selected conversation. Older rows may also contain navigation
+	/// data, which is ignored. The caller must check current navigation and permissions.
+	pub fn startup_selection(&self, account: Id) -> Result<Option<Id>> {
+		if account.0 == 0 {
+			return Ok(None);
+		}
+		self.0
+			.query_row(
+				"SELECT value FROM startup_snapshot WHERE account=?1",
+				[account.to_string()],
+				|row| {
+					let raw = row.get_ref(0)?.as_str().ok();
+					Ok(raw
+						.filter(|raw| raw.len() <= MAX_STARTUP_SELECTION_JSON)
+						.and_then(|raw| serde_json::from_str::<StartupSelection>(raw).ok())
+						.and_then(|selection| selection.selected_channel))
+				},
+			)
+			.optional()
+			.map(Option::flatten)
+			.map_err(Into::into)
+	}
+	pub fn save_startup_selection(&mut self, account: Id, channel: Id) -> Result<()> {
+		if account.0 == 0 || channel.0 == 0 {
+			return Err(StoreError::Capacity);
+		}
+		let encoded = serde_json::to_string(&StartupSelection {
+			selected_channel: Some(channel),
+		})
+		.map_err(|_| StoreError::Capacity)?;
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs() as i64;
+		self.0.execute(
+			"INSERT INTO startup_snapshot(account, updated, value) VALUES(?1, ?2, ?3)
+			 ON CONFLICT(account) DO UPDATE SET updated=excluded.updated, value=excluded.value",
+			params![account.to_string(), now, encoded],
+		)?;
 		Ok(())
 	}
 	pub fn delete_messages(&mut self, account: Id, channel: Id, ids: &[Id]) -> Result<()> {
@@ -1688,6 +1744,7 @@ impl LocalStore {
 			"messages",
 			"channels",
 			"history_starts",
+			"startup_snapshot",
 			"drafts",
 			"gif_favorites",
 			"channel_preferences",
@@ -3843,4 +3900,27 @@ impl LocalStore {
 		assert_eq!(store.reading_preferences().unwrap(), preferences);
 		println!("Double-click reaction migration, roundtrip and bounds passed in memory");
 	}
+}
+
+#[cfg(test)]
+#[test]
+fn startup_selection_restores_older_rows_and_clears_per_account() {
+	let connection = rusqlite::Connection::open_in_memory().unwrap();
+	connection.execute_batch("PRAGMA user_version=29;").unwrap();
+	let mut store = LocalStore::initialize(connection).unwrap();
+	store.save_startup_selection(Id(1), Id(20)).unwrap();
+	store.0.execute(
+		"INSERT INTO startup_snapshot(account, updated, value) VALUES('2', 1, ?1), ('3', 1, '{not-json')",
+		[r#"{"guilds":[{"id":"10","name":"Synthetic"}],"selected_guild":"10","selected_channel":"30"}"#],
+	).unwrap();
+	let mut store = LocalStore::initialize(store.0).unwrap();
+	assert_eq!(store.startup_selection(Id(1)).unwrap(), Some(Id(20)));
+	assert_eq!(store.startup_selection(Id(2)).unwrap(), Some(Id(30)));
+	assert_eq!(store.startup_selection(Id(3)).unwrap(), None);
+
+	store.clear_history(Id(1)).unwrap();
+	assert_eq!(store.startup_selection(Id(1)).unwrap(), None);
+	assert_eq!(store.startup_selection(Id(2)).unwrap(), Some(Id(30)));
+	store.forget_account(Id(2)).unwrap();
+	assert_eq!(store.startup_selection(Id(2)).unwrap(), None);
 }

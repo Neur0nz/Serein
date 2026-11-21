@@ -1,5 +1,19 @@
 # Local storage policy and audit
 
+## Last conversation on startup (November 20, 2026)
+
+Serein shows placeholder workspace columns during saved-login lookup and Gateway connection.
+After Gateway `READY` establishes the account, it can reopen that account's last conversation.
+It checks current navigation and permissions first. Any cached messages enter through the same
+read-permission check as a manually opened conversation.
+
+- The `startup_snapshot` table in `client.sqlite3` (schema version 30) stores one channel ID per
+  account. A newly written record is at most 43 JSON bytes. Older bounded records can supply the
+  selected ID, and their other fields are ignored.
+- The conversation is saved in the background when the selection changes. Account switching and
+  ordinary window close flush the current selection. The synthetic demo uses only fixture data.
+- **Clear cached history**, **Logout**, and **Forget account** remove the selection for that account.
+
 ## Discord device state (November 13, 2026)
 
 REST now keeps the cookies Discord sets, as a browser profile does, so each launch is the same

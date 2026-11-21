@@ -2472,7 +2472,7 @@ mod tests {
 			panic!()
 		};
 		assert!(state.prepare_mark_read(Id(499)).is_none());
-		assert_eq!(state.read_marker(channel), Some(Some(Id(495))));
+		assert_eq!(state.read_marker(channel), Some(Some(Id(500))));
 		state
 			.apply_read_state(R::Ack {
 				channel,
@@ -2591,7 +2591,8 @@ mod tests {
 				result: Ok(()),
 			})
 			.unwrap();
-		assert_eq!(state.read_marker(channel), None);
+		assert!(state.has_fast_pending_writes());
+		assert_eq!(state.read_marker(channel), Some(Some(message)));
 		state
 			.apply_read_state(R::Result {
 				channel,
@@ -2600,6 +2601,7 @@ mod tests {
 				result: Ok(()),
 			})
 			.unwrap();
+		assert!(!state.has_fast_pending_writes());
 		assert_eq!(state.unread(channel), Some(false));
 		state.apply(Envelope {
 			generation: state.generation,

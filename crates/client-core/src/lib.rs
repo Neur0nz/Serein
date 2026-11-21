@@ -24,6 +24,7 @@ pub mod member_search;
 pub mod message_actions;
 pub mod messaging_permissions;
 pub mod notifications;
+pub mod optimistic;
 pub mod polls;
 pub mod preload;
 pub mod presence;
@@ -121,12 +122,13 @@ pub enum Command {
 	},
 	/// None loads the current settings; Some saves the complete folder layout.
 	/// Load, or save `(loaded base, desired)` if Discord still has the base folders.
-	GuildFolders(
-		Option<(
+	GuildFolders {
+		request: u64,
+		change: Option<(
 			model::guild_folders::Settings,
 			model::guild_folders::Settings,
 		)>,
-	),
+	},
 	GroupAction {
 		action: group_actions::Action,
 		request: u64,
@@ -334,12 +336,18 @@ pub enum Command {
 	Delete {
 		channel: Id,
 		message: Id,
+		request: u64,
 	},
 	Pin {
 		request: u64,
 		channel: Id,
 		message: Id,
 		pinned: bool,
+	},
+	/// Cancels a coalesced write if it is still queued pre-wire (before HTTP dispatch).
+	CancelPendingWrite {
+		kind: optimistic::WriteKind,
+		request: u64,
 	},
 }
 pub struct Startup {
@@ -526,7 +534,10 @@ pub enum Event {
 		sequence: u64,
 		result: Result<Id, auth::Failure>,
 	},
-	GuildFolders(Result<model::guild_folders::Settings, auth::Failure>),
+	GuildFolders {
+		request: u64,
+		result: Result<model::guild_folders::Settings, auth::Failure>,
+	},
 	/// Discord says another session (or this one) changed account settings.
 	AccountSettings {
 		status: bool,
@@ -704,6 +715,18 @@ pub enum Event {
 		pinned: bool,
 		result: Result<(), auth::Failure>,
 	},
+	/// A message delete HTTP write finished; `Err` rolls back the optimistic deletion.
+	Deleted {
+		channel: Id,
+		message: Id,
+		request: u64,
+		result: Result<(), auth::Failure>,
+	},
+	/// Confirmed pre-wire cancellation of a superseded coalesced write (never hit the wire).
+	WriteCancelled {
+		kind: optimistic::WriteKind,
+		request: u64,
+	},
 	SendResult {
 		nonce: String,
 		result: Result<Message, auth::Failure>,
@@ -734,6 +757,13 @@ pub struct Envelope {
 	pub generation: u64,
 	pub event: Event,
 }
+
+#[derive(Clone, Copy)]
+pub enum ForwardPart {
+	Message,
+	Note,
+}
+
 pub struct Pending {
 	pub sticker: Option<Sticker>,
 	pub channel: Id,
@@ -743,10 +773,16 @@ pub struct Pending {
 	pub nonce: String,
 	pub delivery: Delivery,
 	pub confirmed: Option<Id>,
+	pub forward: Option<ForwardPart>,
 	/// The reply this send carried, so a failed row can restore it with the caption.
 	pub reply: Option<Reply>,
 }
 impl Pending {
+	/// The body of a pending forward is a display placeholder, not a message draft.
+	pub fn is_forwarded_message(&self) -> bool {
+		matches!(self.forward, Some(ForwardPart::Message))
+	}
+
 	/// Restoring this row would drop its reply target in favour of a different active one.
 	pub fn reply_conflicts(&self, active: Option<Reply>) -> bool {
 		self.reply
@@ -911,6 +947,17 @@ pub struct State {
 	pub gateway_connected: bool,
 	pub revision: u64,
 	pub demo: bool,
+	/// Bounded queue of context-bearing error notices surfaced to the UI toast queue.
+	pub action_errors: Vec<optimistic::ActionError>,
+	/// Bounded queue of coalesced follow-up commands emitted while applying events.
+	#[doc(hidden)]
+	pub follow_up_commands: Vec<Command>,
+	#[doc(hidden)]
+	pub folders_request: u64,
+	#[doc(hidden)]
+	pub folders_confirmed: Option<model::guild_folders::Settings>,
+	#[doc(hidden)]
+	pub folders_queued: Option<model::guild_folders::Settings>,
 	#[doc(hidden)]
 	pub trail: Trail,
 }
@@ -1130,6 +1177,11 @@ impl Default for State {
 			gateway_connected: false,
 			revision: 0,
 			demo: false,
+			action_errors: Vec::new(),
+			follow_up_commands: Vec::new(),
+			folders_request: 0,
+			folders_confirmed: None,
+			folders_queued: None,
 			trail: Trail::default(),
 		}
 	}
@@ -1237,6 +1289,87 @@ impl State {
 				.pending
 				.iter()
 				.any(|p| p.delivery != Delivery::Confirmed)
+	}
+	/// Queues a bounded context-bearing error notice for the UI toast queue.
+	pub(crate) fn push_write_error(
+		&mut self,
+		action: optimistic::ActionKind,
+		target: impl Into<String>,
+		failure: auth::Failure,
+	) {
+		if self.action_errors.len() >= optimistic::MAX_ACTION_ERRORS {
+			self.action_errors.remove(0);
+		}
+		self.action_errors
+			.push(optimistic::ActionError::write(action, target, failure));
+	}
+	/// Drains all queued background action error notices.
+	pub fn take_action_errors(&mut self) -> Vec<optimistic::ActionError> {
+		std::mem::take(&mut self.action_errors)
+	}
+	/// Buffers a coalesced follow-up command emitted during event reconciliation.
+	pub(crate) fn push_follow_up(&mut self, command: Command) {
+		if self.follow_up_commands.len() < optimistic::MAX_FOLLOW_UP_COMMANDS {
+			self.follow_up_commands.push(command);
+		}
+	}
+	/// Drains coalesced follow-up commands to send to the connection.
+	pub fn take_follow_up_commands(&mut self) -> Vec<Command> {
+		std::mem::take(&mut self.follow_up_commands)
+	}
+	/// Whether any fast optimistic background writes are currently in flight.
+	pub fn has_fast_pending_writes(&self) -> bool {
+		self.user_action_pending()
+			|| self.server_actions.has_fast_pending()
+			|| self.channel_actions.has_fast_pending()
+			|| self.group_actions.has_fast_pending()
+			|| self.message_actions.has_fast_pending()
+			|| self.reactions.has_fast_pending()
+			|| self.read_state.has_fast_pending()
+			|| self.polls.has_fast_pending()
+			|| self.folders_pending
+			|| self.messaging_permissions.pending
+	}
+	/// Routes a confirmed pre-wire write cancellation to the owning domain.
+	pub(crate) fn apply_write_cancelled(&mut self, kind: optimistic::WriteKind, request: u64) {
+		match kind {
+			optimistic::WriteKind::UserAction => self.cancel_user_action_pre_wire(request),
+			optimistic::WriteKind::ServerAction => self.cancel_server_action_pre_wire(request),
+			optimistic::WriteKind::ChannelAction => self.cancel_channel_action_pre_wire(request),
+			optimistic::WriteKind::GroupAction => self.cancel_group_action_pre_wire(request),
+			optimistic::WriteKind::Edit => self.cancel_edit_pre_wire(request),
+			optimistic::WriteKind::Reaction => self.cancel_reaction_pre_wire(request),
+			optimistic::WriteKind::ReadState => self.cancel_read_state_pre_wire(request),
+			optimistic::WriteKind::Poll => self.cancel_poll_pre_wire(request),
+			optimistic::WriteKind::MessagingPermissions => {
+				self.cancel_messaging_permissions_pre_wire(request)
+			}
+			_ => {}
+		}
+	}
+	/// Human-readable channel name for error toasts, resolved from cached navigation.
+	pub(crate) fn channel_toast_label(&self, channel: Id) -> String {
+		let Some(ch) = self.channel(channel) else {
+			return String::new();
+		};
+		if !ch.name.is_empty() {
+			if ch.guild.is_some() {
+				format!("#{}", ch.name)
+			} else {
+				ch.name.clone()
+			}
+		} else if let Some(recipient) = ch.recipients.first() {
+			recipient.name.clone()
+		} else {
+			String::new()
+		}
+	}
+	/// Human-readable guild name for error toasts, resolved from cached navigation.
+	pub(crate) fn guild_toast_label(&self, guild: Id) -> String {
+		self.guild(guild)
+			.map(|g| g.name.clone())
+			.filter(|n| !n.is_empty())
+			.unwrap_or_default()
 	}
 	fn set_premium_type(&mut self, kind: u8) {
 		self.premium_type = kind;
@@ -1420,7 +1553,7 @@ impl State {
 		self.search_target = None;
 		self.restore_scroll = false;
 		self.reactions.reset();
-		self.polls.reset();
+		self.polls.reset_view();
 		self.interactions.reset();
 		let scope = self.application_command_scope(channel);
 		self.application_commands.retain(scope);
@@ -2054,6 +2187,7 @@ impl State {
 			nonce: nonce.clone(),
 			delivery: Delivery::Sending,
 			confirmed: None,
+			forward: None,
 			reply,
 		});
 		if sticker.is_none() && !preserve_draft {
@@ -2250,10 +2384,13 @@ impl State {
 			);
 			return;
 		}
-		if matches!(command, Command::GuildFolders(_)) {
-			self.apply_guild_folders(Err(auth::Failure::ProtocolAt(
-				"Server organization was not queued; try again",
-			)));
+		if let Command::GuildFolders { request, .. } = command {
+			self.apply_guild_folders(
+				request,
+				Err(auth::Failure::ProtocolAt(
+					"Server organization was not queued; try again",
+				)),
+			);
 			return;
 		}
 		if let Command::GroupAction { action, request } = command {
@@ -2411,6 +2548,18 @@ impl State {
 		} = command
 		{
 			self.apply_edit_result(channel, message, request, Err(auth::Failure::Capacity));
+			return;
+		}
+		if let Command::Delete {
+			channel,
+			message,
+			request,
+		} = command
+		{
+			self.apply_delete_result(channel, message, request, Err(auth::Failure::Capacity));
+			return;
+		}
+		if matches!(command, Command::CancelPendingWrite { .. }) {
 			return;
 		}
 		if let Command::Pin {
@@ -2859,14 +3008,14 @@ impl State {
 		self.observe_channel_action(&envelope.event);
 		if let Event::ChannelCreated(channel) = &envelope.event {
 			self.observe_dm_reopened(channel.id);
-			self.observe_group_change(channel.id, true);
+			self.observe_group_change(channel.id, true, true);
 		}
 		if let Event::ChannelChanged(patch) = &envelope.event
 			&& (!matches!(patch.name, Patch::Absent)
 				|| !matches!(patch.icon, Patch::Absent)
 				|| !matches!(patch.kind, Patch::Absent))
 		{
-			self.observe_group_change(patch.id, false);
+			self.observe_group_change(patch.id, false, !matches!(patch.name, Patch::Absent));
 		}
 		self.filter_view_revisions(&envelope.event);
 		self.revision += 1;
@@ -2937,8 +3086,8 @@ impl State {
 				}
 				Ok(())
 			}
-			Event::GuildFolders(result) => {
-				self.apply_guild_folders(result);
+			Event::GuildFolders { request, result } => {
+				self.apply_guild_folders(request, result);
 				Ok(())
 			}
 			Event::AccountSettings { folders, .. } => {
@@ -3602,6 +3751,7 @@ impl State {
 				guilds,
 				channels,
 			} => {
+				self.cancel_polls();
 				self.clear_direct_presences();
 				// READY starts a complete snapshot; a presence warning may follow it.
 				self.direct_presence_lossy = false;
@@ -3858,11 +4008,19 @@ impl State {
 				Ok(())
 			}
 			Event::Message(mut m) => {
+				if let Some(poll) = &mut m.poll {
+					self.polls.observe_finalization(m.channel, m.id, poll);
+				}
 				if self.timeline.get(m.id).is_some_and(|old| {
 					old.edited_at
 						.is_none_or(|at| m.edited_at.is_some_and(|new| new >= at))
 				}) {
-					self.message_actions.observe_content(m.channel, m.id);
+					self.message_actions.observe_content(
+						m.channel,
+						m.id,
+						&mut m.content,
+						m.edited_at,
+					);
 				}
 				self.typing_message(&m);
 				if let Some(post) = self
@@ -3912,11 +4070,31 @@ impl State {
 				}
 			}
 			Event::Patch(mut p) => {
-				if !matches!(p.content, Patch::Absent)
-					&& self.timeline.get(p.id).is_some_and(
-						|old| !matches!(p.edited, Patch::Value(at) if old.edited_at.is_some_and(|old| at < old)),
-					) {
-					self.message_actions.observe_content(p.channel, p.id);
+				if let Patch::Value(Some(poll)) = &mut p.poll {
+					self.polls.observe_finalization(p.channel, p.id, poll);
+				}
+				if let Some(old) = self.timeline.get(p.id)
+					&& self.message_actions.edit_pending(p.channel, p.id)
+					&& !matches!(p.edited, Patch::Value(at) if old.edited_at.is_some_and(|old| at < old))
+				{
+					let edited_at = match p.edited {
+						Patch::Value(at) => Some(at),
+						Patch::Null => None,
+						Patch::Absent => old.edited_at,
+					};
+					if !matches!(p.content, Patch::Absent) {
+						let mut content = match std::mem::replace(&mut p.content, Patch::Absent) {
+							Patch::Value(content) => content,
+							_ => String::new(),
+						};
+						self.message_actions.observe_content(
+							p.channel,
+							p.id,
+							&mut content,
+							edited_at,
+						);
+						p.content = Patch::Value(content);
+					}
 				}
 				// A card's cache holds a copy, so an edit must make it read the reply again.
 				if !matches!(p.content, Patch::Absent) || !matches!(p.edited, Patch::Absent) {
@@ -3941,6 +4119,7 @@ impl State {
 				}
 			}
 			Event::Delete { channel, id } => {
+				self.message_actions.observe_delete(channel, id);
 				self.parked_replies.forget_targets(channel, &[id]);
 				self.read_state.activity.delete(channel, id);
 				self.forget_pending_replies(channel, &[id]);
@@ -3983,11 +4162,25 @@ impl State {
 				self.apply_pin_result(channel, message, pinned, request, result);
 				Ok(())
 			}
+			Event::Deleted {
+				channel,
+				message,
+				request,
+				result,
+			} => {
+				self.apply_delete_result(channel, message, request, result);
+				Ok(())
+			}
+			Event::WriteCancelled { kind, request } => {
+				self.apply_write_cancelled(kind, request);
+				Ok(())
+			}
 			Event::DeleteBulk { channel, ids } => {
 				self.parked_replies.forget_targets(channel, &ids);
 				self.thread_previews.forget(channel, &ids);
 				if ids.len() <= 100 {
 					for id in &ids {
+						self.message_actions.observe_delete(channel, *id);
 						self.read_state.activity.delete(channel, *id);
 					}
 					self.forget_pending_replies(channel, &ids);
@@ -4069,6 +4262,7 @@ impl State {
 						}
 					}
 					Err(f) => {
+						let mut failed_forward = None;
 						if let Some(p) = self
 							.pending
 							.iter_mut()
@@ -4079,11 +4273,15 @@ impl State {
 							} else {
 								Delivery::Rejected
 							};
+							failed_forward = p.forward.map(|part| (p.channel, part));
 						}
 						if f.ends_session() {
 							self.fail(f);
 						} else {
 							self.status = f.label();
+							if let Some((channel, part)) = failed_forward {
+								self.report_forward_failure(channel, part, f);
+							}
 						}
 					}
 				}
@@ -4128,6 +4326,8 @@ impl State {
 					"Verification ended by disconnect; retry the message",
 				);
 				self.member_search = Default::default();
+				self.follow_up_commands.clear();
+				self.interrupt_guild_folders();
 				self.cancel_message_actions();
 				self.cancel_user_action();
 				self.cancel_server_action();
@@ -4161,6 +4361,8 @@ impl State {
 				Ok(())
 			}
 			Event::Resync | Event::PermissionsChanged => {
+				self.follow_up_commands.clear();
+				self.interrupt_guild_folders();
 				self.cancel_message_actions();
 				self.cancel_user_action();
 				self.cancel_server_action();
@@ -4388,7 +4590,7 @@ impl State {
 			self.local_game_activity = Default::default();
 			self.cancel_message_actions();
 			if self.folders_pending {
-				self.folders_pending = false;
+				self.interrupt_guild_folders();
 				self.folders_error = Some(failure.label());
 			}
 			self.cancel_user_action();
@@ -4419,7 +4621,7 @@ impl State {
 		self.history_navigation.clear();
 		self.typing.clear();
 		self.reactions.reset();
-		self.polls.reset();
+		self.polls.reset_view();
 		self.interactions.reset();
 		self.search_target = None;
 		self.restore_scroll = false;
@@ -4533,7 +4735,7 @@ impl Event {
 					.result
 					.as_ref()
 					.map_or(0, model::server_admin::Result::bytes),
-				Self::GuildFolders(result) => result
+				Self::GuildFolders { result, .. } => result
 					.as_ref()
 					.map_or(0, model::guild_folders::Settings::heap_bytes),
 				Self::ServerAction(server_actions::Event::Written {
@@ -5672,7 +5874,7 @@ mod tests {
 			panic!()
 		};
 		assert!(add);
-		assert!(state.prepare_reaction(id, emoji.clone()).is_none());
+		assert!(state.reactions.has_fast_pending());
 		apply(
 			&mut state,
 			Event::Reactions(E::Written {
@@ -5682,7 +5884,7 @@ mod tests {
 				result: Err(auth::Failure::Ambiguous),
 			}),
 		);
-		assert!(state.reactions.writing.is_none());
+		assert!(!state.reactions.has_fast_pending());
 		let Command::Reactions(R::Read { request, .. }) = state.next_reaction_read().unwrap()
 		else {
 			panic!()
@@ -5731,7 +5933,7 @@ mod tests {
 			Command::Reactions(R::Set { add: false, .. })
 		));
 		state.command_rejected(command);
-		assert!(state.reactions.writing.is_none());
+		assert!(!state.reactions.has_fast_pending());
 		assert_eq!(state.freshness, Freshness::Fresh);
 		// Successful reaction removal/readback changes only reactions, not chat access.
 		let original_content = state.timeline.get(id).unwrap().content.clone();

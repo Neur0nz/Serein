@@ -991,10 +991,8 @@ pub(crate) fn friend_target(state: &State, user: &User) -> bool {
 }
 /// Whether the account may send relationship and moderation requests right now.
 pub(crate) fn actions_enabled(state: &State) -> bool {
-	!state.user_action_pending()
-		&& (state.demo
-			|| (state.gateway_connected
-				&& state.auth == client_core::auth::AuthState::Authenticated))
+	state.demo
+		|| (state.gateway_connected && state.auth == client_core::auth::AuthState::Authenticated)
 }
 /// Translucent round button over the banner; disabled circles still show their tooltip.
 fn header_circle(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui::Response {
@@ -1270,8 +1268,7 @@ impl crate::MessagingUi {
 		.danger()
 		.confirm_label("profiles-more-menu-remove-friend")
 		.enabled(
-			!state.user_action_pending()
-				&& state.friends_known()
+			state.friends_known()
 				&& state.friend_requests_known()
 				&& (state.demo
 					|| (state.gateway_connected
@@ -3393,7 +3390,7 @@ fn message_input(
 			crate::i18n::translate("profiles-message-sending"),
 			theme.muted,
 		))
-	} else if !state.can_open_user_dm(user) && !state.user_action_pending() {
+	} else if !state.can_open_user_dm(user) && !state.dm_open_pending() {
 		Some((
 			crate::i18n::translate("profiles-message-offline"),
 			theme.text,

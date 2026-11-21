@@ -74,7 +74,10 @@ use client_core::{
 };
 use eframe::egui;
 use model::Delivery;
-use std::{sync::Arc, time::Duration};
+use std::{
+	sync::Arc,
+	time::{Duration, Instant},
+};
 use zeroize::Zeroizing;
 
 /// Run explicit offline checks before native startup, or launch the configured desktop client.
@@ -1214,7 +1217,7 @@ struct Desktop {
 	confirming_logout: bool,
 	/// What the pending session teardown is for: logging out, switching or adding an account.
 	end_intent: SessionEnd,
-	/// Saved account whose token is being read for a switch.
+	/// Expected account while restoring a login for an explicit switch.
 	switching: Option<model::Id>,
 	/// A switcher-roster write is in flight; failures stop retrying for this session.
 	roster_pending: bool,
@@ -1222,6 +1225,17 @@ struct Desktop {
 	/// Session generation whose account was last recorded in the switcher roster.
 	roster_generation: Option<u64>,
 	close_approved: bool,
+	/// Tier-1 silent close drain deadline when only fast optimistic / cache writes remain.
+	closing_drain: Option<ClosingDrain>,
+	/// Set when a background write fails during silent close drain, falling back to confirm modal.
+	closing_drain_failed: bool,
+	#[cfg(feature = "demo")]
+	startup_demo: bool,
+	restoring_saved_login: bool,
+	startup_selection_loading: bool,
+	startup_selection_saved_at: Option<Instant>,
+	startup_selection_saved: Option<model::Id>,
+	startup_selection_saving: Option<model::Id>,
 	fixture_only: bool,
 	/// Sign-in screen disclosures, folded away until the owner opens them.
 	about_open: bool,
@@ -1231,6 +1245,12 @@ struct Desktop {
 	#[cfg(feature = "demo")]
 	synthetic_id: u64,
 	token_input: Zeroizing<String>,
+}
+#[derive(Clone, Copy)]
+struct ClosingDrain {
+	deadline: Instant,
+	generation: u64,
+	background_failures: Option<u64>,
 }
 /// Why a connection ended. Fixed labels, flags and redacted details only, so the diagnostics
 /// report can show it whether or not logging was on.
@@ -1352,19 +1372,6 @@ fn access_candidates(state: &State, event: &Event) -> Vec<model::Id> {
 		.map(|c| c.id)
 		.collect()
 }
-fn user_action_notice(event: &Event) -> Option<(ui::design::Level, &'static str)> {
-	let Event::UserAction(client_core::user_actions::Event::Written { action, result, .. }) = event
-	else {
-		return None;
-	};
-	Some(match result {
-		Ok(()) if matches!(action, client_core::user_actions::Action::OpenDm(_)) => {
-			(ui::design::Level::Error, action.completion_label())
-		}
-		Ok(()) => (ui::design::Level::Success, action.completion_label()),
-		Err(failure) => (ui::design::Level::Error, failure.label()),
-	})
-}
 fn queue_channel_preferences(
 	cache: Option<&cache::Cache>,
 	messaging: &mut ui::MessagingUi,
@@ -1455,6 +1462,23 @@ fn hydrate_cache_result(state: &mut State, safety: &cache::HistorySafety, outcom
 	}
 }
 
+fn startup_selection(state: &State, account: model::Id, channel: model::Id) -> Option<model::Id> {
+	(state.auth == AuthState::Authenticated
+		&& state.gateway_connected
+		&& state.user.as_ref().is_some_and(|user| user.id == account)
+		&& state.selected.is_none()
+		&& state.trail.is_empty()
+		&& state.channel(channel).is_some_and(|target| {
+			client_core::navigable(target)
+				&& if target.supports_text() {
+					state.can_read_history(channel)
+				} else {
+					state.can_view(channel)
+				}
+		}))
+	.then_some(channel)
+}
+
 fn recovery_draft(state: &State, channel: model::Id) -> String {
 	state
 		.drafts
@@ -1467,7 +1491,9 @@ fn recovery_draft(state: &State, channel: model::Id) -> String {
 				.iter()
 				.rev()
 				.find(|pending| {
-					pending.channel == channel && pending.delivery != Delivery::Confirmed
+					pending.channel == channel
+						&& pending.delivery != Delivery::Confirmed
+						&& !pending.is_forwarded_message()
 				})
 				.map(|pending| pending.content.clone())
 		})
@@ -1518,6 +1544,11 @@ fn changes_active_history(state: &State, event: &Event) -> bool {
 		Event::Patch(patch) => &patch.channel,
 		Event::Edited { channel, .. }
 		| Event::Delete { channel, .. }
+		| Event::Deleted {
+			channel,
+			result: Ok(()),
+			..
+		}
 		| Event::DeleteBulk { channel, .. } => channel,
 		_ => return false,
 	};
@@ -1559,7 +1590,7 @@ fn demo_fetch(command: &Command) -> bool {
 		Command::ServerAdmin { action, .. } => !action.write(),
 		Command::ServerSettings { edit, .. } => edit.is_none(),
 		Command::Onboarding { action, .. } => matches!(action, onboarding::Action::Load { .. }),
-		Command::GuildFolders(change) => change.is_none(),
+		Command::GuildFolders { change, .. } => change.is_none(),
 		Command::MessagingPermissions { change, .. } => change.is_none(),
 		Command::EditProfile { changes, .. } => changes.is_none(),
 		Command::GifFavorites { change, .. } => change.is_none(),
@@ -2782,6 +2813,15 @@ impl Desktop {
 			roster_failed: false,
 			roster_generation: None,
 			close_approved: false,
+			closing_drain: None,
+			closing_drain_failed: false,
+			#[cfg(feature = "demo")]
+			startup_demo: demo && std::env::args().any(|arg| arg == "--demo-restoring"),
+			restoring_saved_login: false,
+			startup_selection_loading: false,
+			startup_selection_saved_at: None,
+			startup_selection_saved: None,
+			startup_selection_saving: None,
 			fixture_only: demo,
 			about_open: sign_in_panels,
 			token_open: sign_in_panels,
@@ -2815,6 +2855,8 @@ impl Desktop {
 				cache::Operation::LoadChannel { .. }
 					| cache::Operation::SaveChannel { .. }
 					| cache::Operation::SaveChanges { .. }
+					| cache::Operation::LoadStartupSelection
+					| cache::Operation::SaveStartupSelection(_)
 			) && !cache.history.allows(cache.history.epoch())
 			{
 				return false;
@@ -3778,6 +3820,12 @@ impl Desktop {
 		};
 		let (channel, ids) = match event {
 			Event::Delete { channel, id } => (*channel, vec![*id]),
+			Event::Deleted {
+				channel,
+				message,
+				result: Ok(()),
+				..
+			} => (*channel, vec![*message]),
 			Event::DeleteBulk { channel, ids } if !ids.is_empty() && ids.len() <= 100 => {
 				(*channel, ids.clone())
 			}
@@ -3788,6 +3836,40 @@ impl Desktop {
 			_ => return,
 		};
 		self.delete_cached_ids(channel, ids);
+	}
+	fn sync_startup_selection(&mut self, ctx: &egui::Context, force: bool) {
+		if self.fixture_only
+			|| self.state.demo
+			|| self.cache_error
+			|| self.state.auth != AuthState::Authenticated
+		{
+			return;
+		}
+		let Some(channel) = self.state.selected else {
+			return;
+		};
+		if self
+			.startup_selection_saving
+			.or(self.startup_selection_saved)
+			== Some(channel)
+		{
+			return;
+		}
+		if !force {
+			if self.startup_selection_saving.is_some() {
+				return;
+			}
+			if let Some(at) = self.startup_selection_saved_at {
+				let remaining = Duration::from_secs(30).saturating_sub(at.elapsed());
+				if !remaining.is_zero() {
+					ctx.request_repaint_after(remaining);
+					return;
+				}
+			}
+		}
+		if self.queue_cache(cache::Operation::SaveStartupSelection(channel)) {
+			self.startup_selection_saving = Some(channel);
+		}
 	}
 	fn delete_cached_ids(&mut self, channel: model::Id, ids: Vec<model::Id>) {
 		if self.state.demo || self.fixture_only || ids.is_empty() {
@@ -3806,6 +3888,15 @@ impl Desktop {
 		}
 	}
 	/// Dispatches one queued command to the demo or live transport.
+	fn show_action_errors(&mut self) {
+		for error in self.state.take_action_errors() {
+			if self.closing_drain.is_some() {
+				self.closing_drain_failed = true;
+			}
+			self.messaging.toasts.push_write_error(error);
+		}
+	}
+
 	fn command(&mut self, command: Command) {
 		// The offline preview has no one to tell.
 		if matches!(command, Command::Typing { .. }) && (self.state.demo || self.fixture_only) {
@@ -4123,9 +4214,10 @@ impl Desktop {
 					request,
 					action,
 				} => onboarding_demo::execute(guild, request, action),
-				Command::GuildFolders(settings) => Event::GuildFolders(Ok(settings
-					.map(|(_, settings)| settings)
-					.unwrap_or_default())),
+				Command::GuildFolders { request, change } => Event::GuildFolders {
+					request,
+					result: Ok(change.map(|(_, settings)| settings).unwrap_or_default()),
+				},
 				Command::SendServerInvite {
 					guild,
 					user,
@@ -4299,7 +4391,6 @@ impl Desktop {
 								});
 							}
 							reactions.retain(|r| r.count > 0);
-							self.state.reactions.reset();
 							let _ = self.state.timeline.set_reactions(message, Some(reactions));
 							// The fixture has no service readback; it updates synthetic RAM only.
 							E::Written {
@@ -4868,10 +4959,19 @@ impl Desktop {
 						result,
 					}
 				}
-				Command::Delete { channel, message } => Event::Delete {
+				Command::Delete {
 					channel,
-					id: message,
+					message,
+					request,
+				} => Event::Deleted {
+					channel,
+					message,
+					request,
+					result: Ok(()),
 				},
+				Command::CancelPendingWrite { kind, request } => {
+					Event::WriteCancelled { kind, request }
+				}
 				Command::Pin {
 					request,
 					channel,
@@ -4893,8 +4993,8 @@ impl Desktop {
 			return;
 		}
 		if let Some(connection) = &self.connection {
-			if let Err(error) = connection.commands.try_send(command) {
-				self.state.command_rejected(error.into_inner());
+			if let Some(command) = connection.submit(command) {
+				self.state.command_rejected(command);
 			}
 		} else {
 			self.state.command_rejected(command);
@@ -5259,6 +5359,50 @@ impl Desktop {
 				continue;
 			}
 			match outcome {
+				cache::Outcome::StartupSelection {
+					account,
+					channel,
+					epoch,
+				} => {
+					self.restoring_saved_login = false;
+					self.startup_selection_loading = false;
+					if self.cache.as_ref().is_some_and(|c| c.history.allows(epoch))
+						&& self
+							.state
+							.user
+							.as_ref()
+							.is_some_and(|user| user.id == account)
+					{
+						self.startup_selection_saved = channel;
+						if let Some(channel) =
+							channel.and_then(|id| startup_selection(&self.state, account, id))
+							&& let Some(command) = self.state.select(channel)
+						{
+							self.command(command);
+						}
+					}
+				}
+				cache::Outcome::StartupSelectionSaved {
+					channel,
+					result,
+					epoch,
+				} => {
+					if self.startup_selection_saving == Some(channel) {
+						self.startup_selection_saving = None;
+					}
+					if let Some(result) = result {
+						if result.is_err() {
+							self.cache_error = true;
+							self.cache_status = "Could not save the last conversation";
+						} else if self.cache.as_ref().is_some_and(|c| c.history.allows(epoch)) {
+							self.startup_selection_saved = Some(channel);
+							self.startup_selection_saved_at = Some(Instant::now());
+							if !self.cache_error {
+								self.cache_status = "Local changes saved";
+							}
+						}
+					}
+				}
 				cache::Outcome::ChannelPreferences(result) => {
 					self.messaging.channel_preferences_load_pending = false;
 					self.messaging.channel_preferences_reload = false;
@@ -5359,8 +5503,11 @@ impl Desktop {
 						// `connect()` already sets a "Connecting to Discord…" status; avoid
 						// stacking a second, near-duplicate line under the restore screen.
 						self.credential_status = "";
+						self.switching = switching;
+						self.restoring_saved_login = true;
 						self.connect(secret, switching.is_some(), ctx);
 					} else {
+						self.restoring_saved_login = false;
 						self.credential_status = credentials::loaded_status(&result);
 						if let Some(account) = switching {
 							// The entry stays: the owner decides whether to forget it. Signing
@@ -5498,14 +5645,20 @@ impl Desktop {
 				}
 				continue;
 			}
-			let user_action_notice = user_action_notice(&event.event);
-			let user_action_was_pending =
-				user_action_notice.is_some() && self.state.user_action_pending();
 			self.delete_cached_messages(&event.event);
 			match &event.event {
 				Event::Delete { channel, id } => {
 					self.messaging
 						.messages_deleted(ctx, *channel, std::slice::from_ref(id));
+				}
+				Event::Deleted {
+					channel,
+					message,
+					result: Ok(()),
+					..
+				} => {
+					self.messaging
+						.messages_deleted(ctx, *channel, std::slice::from_ref(message));
 				}
 				Event::DeleteBulk { channel, ids } if ids.len() <= 100 => {
 					self.messaging.messages_deleted(ctx, *channel, ids);
@@ -5540,7 +5693,26 @@ impl Desktop {
 			) || matches!(&event.event, Event::RecipientRemoved { user, .. } if self.state.user.as_ref().is_some_and(|owner| owner.id == *user))
 				|| matches!(&event.event, Event::Reactions(client_core::reactions::Event::Read {channel,result:Err(Failure::Forbidden),..}) if self.state.selected==Some(*channel))
 				|| matches!(&event.event, Event::HistoryFailed { channel, request, failure: Failure::Forbidden }
-                if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending);
+                if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending)
+				|| matches!(
+					&event.event,
+					Event::ServerAction(client_core::server_actions::Event::Written {
+						action: client_core::server_actions::Action::Leave(_),
+						result: Ok(None),
+						..
+					}) | Event::GroupAction(client_core::group_actions::Event::Written {
+						result: Ok(None),
+						..
+					}) | Event::UserAction(client_core::user_actions::Event::Written {
+						action: client_core::user_actions::Action::CloseDm(_)
+							| client_core::user_actions::Action::MessageRequest {
+								accept: false,
+								..
+							},
+						result: Ok(()),
+						..
+					})
+				);
 			let history_changed = changes_active_history(&self.state, &event.event);
 			if history_changed {
 				match &event.event {
@@ -5624,12 +5796,6 @@ impl Desktop {
 					self.extensions.message_event(&self.state, event);
 				}
 			}
-			if user_action_was_pending
-				&& !self.state.user_action_pending()
-				&& let Some((level, text)) = user_action_notice
-			{
-				self.messaging.toasts.push(level, text);
-			}
 			// Only admitted service messages can establish a deleted reply target.
 			// Fence pending disk writes before the post-drain timeline snapshot is saved.
 			let deleted_replies = self.state.take_reply_deletions();
@@ -5651,6 +5817,10 @@ impl Desktop {
 			{
 				self.command(command);
 			}
+			for command in self.state.take_follow_up_commands() {
+				self.command(command);
+			}
+			self.show_action_errors();
 			// ponytail: accepted navigation removals clear account-wide history;
 			// add scoped disk deletion if channel churn makes refetch cost significant.
 			if invalidate || !removed_channels.is_empty() {
@@ -5662,6 +5832,15 @@ impl Desktop {
 				self.queue_cache(cache::Operation::SaveDraft { channel, content });
 			}
 			if ready && self.state.auth == AuthState::Authenticated {
+				self.switching = None;
+				// The authenticated account in READY is authoritative; roster order is unrelated.
+				if self.restoring_saved_login && !self.startup_selection_loading {
+					self.startup_selection_loading = self.state.selected.is_none()
+						&& self.state.trail.is_empty()
+						&& self.queue_cache(cache::Operation::LoadStartupSelection);
+					// A token refresh may replace this generation before its load completes.
+					self.restoring_saved_login = self.startup_selection_loading;
+				}
 				// The worker survives logout; each accepted account READY restores its own drafts.
 				if !self.messaging.draft_restore_pending {
 					self.messaging.draft_restore_pending =
@@ -5731,12 +5910,17 @@ impl Desktop {
 			&& let Some(channel) = self.state.selected
 			&& self.state.can_read_history(channel)
 		{
+			let mut retained = Vec::new();
 			let messages = self
 				.state
-				.timeline
-				.iter()
-				.filter(|m| full_window || changed_messages.contains(&m.id))
-				.cloned()
+				.confirmed_history_messages()
+				.filter_map(|message| {
+					if !full_window {
+						retained.push(message.id);
+					}
+					(full_window || changed_messages.contains(&message.id))
+						.then(|| message.into_owned())
+				})
 				.collect();
 			let start = self.state.older_exhausted && !self.state.timeline.older_evicted();
 			let operation = if full_window {
@@ -5749,7 +5933,7 @@ impl Desktop {
 				cache::Operation::SaveChanges {
 					channel,
 					messages,
-					retained: self.state.timeline.iter().map(|m| m.id).collect(),
+					retained,
 					start,
 				}
 			};
@@ -5792,6 +5976,7 @@ impl Desktop {
 			self.connection = None;
 			self.pending_save = None;
 			self.pending_account_save = None;
+			self.clear_startup_restore();
 			self.voice.stop();
 			self.messaging.camera_test_requested = false;
 			self.messaging.camera_test_texture = None;
@@ -5856,11 +6041,13 @@ impl Desktop {
 			self.connect(secret, true, ctx);
 		}
 		if let Some(secret) = self.native.poll(ctx) {
+			self.clear_startup_restore();
 			self.connect(secret, true, ctx);
 		}
 		if let Some(login) = &self.login {
 			login.pump();
 			if let Some(secret) = login.token() {
+				self.clear_startup_restore();
 				self.connect(secret, true, ctx);
 			} else if login.expired() {
 				let crashed = login.crashed();
@@ -6866,35 +7053,84 @@ impl eframe::App for Desktop {
 			self.messaging.accept_server_sticker(&ctx, scope, result);
 		}
 		self.messaging.voice_available = true;
-		if close_requested
-			&& !self.close_approved
-			&& !self.tray_window.system_close()
-			&& ((self.state.demo && self.state.has_unsent())
-				|| self
-					.state
-					.pending
-					.iter()
-					.any(|p| p.delivery != Delivery::Confirmed)
-				|| self.messaging.has_edit()
-				|| self.messaging.has_server_settings_changes()
-				|| self.messaging.extensions.theme_editor_dirty()
-				|| self.state.server_settings.pending
-				|| self.state.server_admin.pending
-				|| self.uploads.has_unsent()
-				|| self.messaging.external_upload.has_unsent()
-				|| self.forgetting
-				|| self.messaging.startup_busy
-				|| self.avatar_cleanup.is_some()
-				|| self.cache_pending > 0
-				|| self.cache_clears.pending()
-				|| (!self.fixture_only && self.app_settings.state.needs_attention())
-				|| (!self.fixture_only && self.reading.needs_attention())
-				|| (!self.fixture_only && self.game_activity.needs_attention())
-				|| (!self.fixture_only && self.tray_setting.needs_attention())
-				|| self.cache_error)
-		{
-			ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-			self.confirming_close = true;
+		self.show_action_errors();
+		for command in self.state.take_follow_up_commands() {
+			self.command(command);
+		}
+		let heavy_close_guard = (self.state.demo && self.state.has_unsent())
+			|| self
+				.state
+				.pending
+				.iter()
+				.any(|p| p.delivery != Delivery::Confirmed)
+			|| self.messaging.has_edit()
+			|| self.messaging.has_server_settings_changes()
+			|| self.messaging.extensions.theme_editor_dirty()
+			|| self.state.server_settings.pending
+			|| self.state.server_admin.pending
+			|| self.state.server_action_pending()
+			|| self.state.administrative_channel_write_pending()
+			|| self.state.group_action_pending()
+			|| self.state.dm_open_pending()
+			|| self.state.group_create_pending()
+			|| self.state.polls.pending.is_some()
+			|| self.state.account_challenge().is_some()
+			|| self.uploads.has_unsent()
+			|| self.messaging.external_upload.has_unsent()
+			|| self.forgetting
+			|| self.messaging.startup_busy
+			|| self.avatar_cleanup.is_some()
+			|| self.cache_clears.pending()
+			|| (!self.fixture_only && self.app_settings.state.needs_attention())
+			|| (!self.fixture_only && self.reading.needs_attention())
+			|| (!self.fixture_only && self.game_activity.needs_attention())
+			|| (!self.fixture_only && self.tray_setting.needs_attention())
+			|| self.cache_error;
+		if close_requested && !self.close_approved && !self.tray_window.system_close() {
+			self.sync_startup_selection(&ctx, true);
+		}
+		let background = self
+			.connection
+			.as_ref()
+			.map(connection::Connection::background_write_status);
+		let fast_close_work = self.state.has_fast_pending_writes()
+			|| self.cache_pending > 0
+			|| background.is_some_and(|(outstanding, _)| outstanding > 0);
+		if close_requested && !self.close_approved && !self.tray_window.system_close() {
+			if heavy_close_guard {
+				ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.confirming_close = true;
+			} else if fast_close_work {
+				ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+				self.closing_drain.get_or_insert_with(|| ClosingDrain {
+					deadline: Instant::now() + Duration::from_millis(1500),
+					generation: self.state.generation,
+					background_failures: background.map(|(_, failures)| failures),
+				});
+				ctx.request_repaint();
+			}
+		}
+		if let Some(drain) = self.closing_drain {
+			let failed = self.closing_drain_failed
+				|| drain.generation != self.state.generation
+				|| drain.background_failures.is_some_and(|initial| {
+					background.is_none_or(|(_, failures)| failures != initial)
+				});
+			if !heavy_close_guard && !failed && !fast_close_work {
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.close_approved = true;
+				ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+			} else if heavy_close_guard || failed || Instant::now() >= drain.deadline {
+				self.closing_drain = None;
+				self.closing_drain_failed = false;
+				self.confirming_close = true;
+			} else {
+				let remaining = drain.deadline.saturating_duration_since(Instant::now());
+				ctx.request_repaint_after(remaining.min(Duration::from_millis(50)));
+			}
 		}
 		// The window size the interface layout shown this frame asks for.
 		let mut interface_size = None;
@@ -6982,6 +7218,8 @@ impl eframe::App for Desktop {
 			if let Some(login) = &self.login {
 				login.resize(&self.window);
 			}
+		} else if let Some(stage) = self.restoring() {
+			self.restoring_screen(ui, &stage);
 		} else if self.state.user.is_some() {
 			self.messaging.storage_status = self.cache_status;
 			self.messaging.notification_status = self.notifications.status().label();
@@ -7443,6 +7681,8 @@ impl eframe::App for Desktop {
 			}
 			if self.messaging.clear_cache_requested {
 				self.messaging.clear_cache_requested = false;
+				// Keep the open conversation in RAM without immediately saving its selection again.
+				self.startup_selection_saved = self.state.selected;
 				self.state.clear_cached_history();
 				self.clear_avatars(&ctx);
 				self.queue_cache(cache::Operation::ClearHistory);
@@ -7460,17 +7700,18 @@ impl eframe::App for Desktop {
 				ctx.request_repaint_after(due - now);
 			}
 			commands.extend(self.state.take_preload_retries());
+			commands.extend(self.state.take_follow_up_commands());
+			self.show_action_errors();
 			for command in commands {
 				self.command(command);
 			}
 			// A click that adopted a hover preload sends no request of its own.
 			self.load_cached_history();
+			self.sync_startup_selection(&ctx, false);
 			if self.messaging.logout_requested {
 				self.messaging.logout_requested = false;
 				self.request_session_end(&ctx, SessionEnd::Logout);
 			}
-		} else if let Some(stage) = self.restoring() {
-			self.restoring_screen(ui, &stage);
 		} else {
 			self.sign_in_screen(ui);
 		}
@@ -7635,6 +7876,9 @@ impl eframe::App for Desktop {
 				notes.push(
 					"Cached history cleanup is pending; closing now may leave deleted messages on disk.",
 				);
+			}
+			if self.state.has_fast_pending_writes() || self.cache_pending > 0 {
+				notes.push("Background changes are still finishing.");
 			}
 			if !self.fixture_only && self.app_settings.state.needs_attention() {
 				notes.push(self.app_settings.state.status());
@@ -8055,6 +8299,27 @@ mod tests {
 			false,
 		);
 		assert!(state.timeline.is_empty());
+	}
+	#[test]
+	fn saved_startup_selection_requires_the_ready_account_and_current_access() {
+		let mut state = test_support::demo_state();
+		let channel = state.selected.take().unwrap();
+		let account = state.user.as_ref().unwrap().id;
+		state.trail = client_core::Trail::default();
+		assert_eq!(startup_selection(&state, account, channel), Some(channel));
+		assert_eq!(startup_selection(&state, model::Id(999), channel), None);
+
+		state.auth = AuthState::Authenticating;
+		assert_eq!(startup_selection(&state, account, channel), None);
+		state.auth = AuthState::Authenticated;
+		let permissions = state.permissions.clone();
+		state.permissions.channels.remove(&channel);
+		state.permissions.clear_cache();
+		assert_eq!(startup_selection(&state, account, channel), None);
+
+		state.permissions = permissions;
+		state.open_home();
+		assert_eq!(startup_selection(&state, account, channel), None);
 	}
 	#[test]
 	fn attachment_sends_stay_allowed_while_the_latest_page_reloads() {

@@ -49,8 +49,10 @@ impl FolderUi {
 			.map(|g| (Item::Server(g.id), None))
 			.collect();
 		if let Some(settings) = &state.guild_folders {
-			for set in [&mut self.expanded, &mut self.closing] {
-				set.retain(|id| settings.folders.iter().any(|f| f.id == Some(*id)));
+			if !state.folders_pending {
+				for set in [&mut self.expanded, &mut self.closing] {
+					set.retain(|id| settings.folders.iter().any(|f| f.id == Some(*id)));
+				}
 			}
 			let shown = |id| self.expanded.contains(&id) || self.closing.contains(&id);
 			for folder in &settings.folders {
@@ -388,9 +390,7 @@ impl MessagingUi {
 		}
 		self.folder_ui.sync_rows(state);
 		let colors = design::palette(ui);
-		let enabled = state.guild_folders.is_some()
-			&& !state.folders_pending
-			&& (state.gateway_connected || state.demo);
+		let enabled = state.guild_folders.is_some() && (state.gateway_connected || state.demo);
 		let mut change = None;
 		let mut refresh = false;
 		let mut drop_rows = Vec::new();
@@ -1330,15 +1330,23 @@ mod tests {
 			let mut changed = state.guild_folders.clone().unwrap();
 			edit(&mut changed, Edit::Dissolve(7));
 			let command = state.save_guild_folders(changed.clone()).unwrap();
-			assert!(!folders.sync_rows(&state));
+			assert!(folders.sync_rows(&state));
 			state.command_rejected(command);
-			assert!(!folders.sync_rows(&state));
+			assert!(folders.sync_rows(&state));
 			assert!(state.folders_error.is_some());
 			assert_eq!(folders.rows, original);
-			assert!(state.save_guild_folders(changed.clone()).is_some());
+			let Command::GuildFolders { request, .. } =
+				state.save_guild_folders(changed.clone()).unwrap()
+			else {
+				panic!("expected a folder write");
+			};
+			assert!(folders.sync_rows(&state));
 			state.apply(client_core::Envelope {
 				generation: state.generation,
-				event: client_core::Event::GuildFolders(Ok(changed)),
+				event: client_core::Event::GuildFolders {
+					request,
+					result: Ok(changed),
+				},
 			});
 			assert!(folders.sync_rows(&state));
 			assert_eq!(
@@ -1351,10 +1359,15 @@ mod tests {
 			);
 			assert!(folders.expanded.is_empty());
 			let original = folders.rows.clone();
-			assert!(state.load_guild_folders().is_some());
+			let Command::GuildFolders { request, .. } = state.load_guild_folders().unwrap() else {
+				panic!("expected a folder reload");
+			};
 			state.apply(client_core::Envelope {
 				generation: state.generation,
-				event: client_core::Event::GuildFolders(Err(client_core::auth::Failure::Network)),
+				event: client_core::Event::GuildFolders {
+					request,
+					result: Err(client_core::auth::Failure::Network),
+				},
 			});
 			assert!(folders.sync_rows(&state));
 			assert!(state.folders_error.is_some());

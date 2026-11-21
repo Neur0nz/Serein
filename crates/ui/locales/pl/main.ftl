@@ -4942,3 +4942,15 @@ moderation-confirm-ban = Zbanuj
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Ta wtyczka nie ma jeszcze nic do pokazania.
+
+# Optimistic write feedback
+action-write-failed = Nie udało się wykonać działania „{ $action }”. { $reason }
+action-write-failed-for = Nie udało się wykonać działania „{ $action }” dla { $target }. { $reason }
+action-write-forward-note = Wyślij notatkę do przekazanej wiadomości
+action-write-poll = Ankieta
+action-write-forbidden = Brak uprawnień.
+action-write-rate-limited = Odczekaj chwilę, zanim spróbujesz ponownie.
+action-write-network = Nie udało się nawiązać połączenia.
+action-write-ambiguous = Wynik jest nieznany. Sprawdź Discorda przed ponowną próbą.
+action-write-busy = Zbyt wiele zmian oczekuje na zapis. Spróbuj ponownie za chwilę.
+action-write-rejected = Discord odrzucił zmianę lub zwrócił nieoczekiwaną odpowiedź.

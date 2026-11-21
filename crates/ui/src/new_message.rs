@@ -72,7 +72,7 @@ impl NewMessageUi {
 		self.selected.retain(|user| state.friend(*user).is_some());
 		let mut create = false;
 		let mut close = false;
-		let pending = state.user_action_pending();
+		let pending = state.dm_open_pending() || state.group_create_pending();
 		let response =
 			dialog::Dialog::new("new-message", crate::i18n::translate("new-message-title"))
 				.subtitle(crate::i18n::translate("new-message-subtitle"))

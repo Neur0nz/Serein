@@ -6,7 +6,6 @@ use model::Id;
 #[derive(Default)]
 pub(super) struct Editor {
 	edits: NotificationOptions,
-	submitted: bool,
 }
 impl Editor {
 	pub fn show(
@@ -18,13 +17,6 @@ impl Editor {
 		commands: &mut Vec<Command>,
 	) -> bool {
 		let current = state.server_notification_settings(guild);
-		let pending = state.server_action_pending();
-		if self.submitted && !pending {
-			// Show the reconciled account state after completion, including a newer
-			// Gateway update. Errors remain visible; another write needs a new choice.
-			self.submitted = false;
-			self.edits = NotificationOptions::default();
-		}
 		let available = state.can_update_server_notifications(guild);
 		let mut save = false;
 		let mut close = false;
@@ -41,7 +33,7 @@ impl Editor {
 				egui::ScrollArea::vertical()
 					.max_height(max_height)
 					.show(ui, |ui| {
-						ui.add_enabled_ui(available && !pending, |ui| {
+						ui.add_enabled_ui(available, |ui| {
 							let level = self.edits.level.or(current.level);
 							let default = match state
 								.guild(guild)
@@ -100,7 +92,7 @@ impl Editor {
 								"server-notifications-unknown",
 							);
 						}
-						if !available && !pending {
+						if !available {
 							dialog::notice(
 								ui,
 								dialog::Level::Warning,
@@ -117,15 +109,11 @@ impl Editor {
 			});
 			d.footer(|ui| {
 				ui.add_enabled_ui(
-					available && !pending && self.edits != NotificationOptions::default(),
+					available && self.edits != NotificationOptions::default(),
 					|ui| {
 						save = dialog::action(
 							ui,
-							if pending {
-								"server-notifications-saving"
-							} else {
-								"server-notifications-save"
-							},
+							"server-notifications-save",
 							dialog::Action::Primary,
 						)
 						.clicked();
@@ -135,9 +123,12 @@ impl Editor {
 					dialog::action(ui, "server-menu-show-close", dialog::Action::Neutral).clicked();
 			});
 		});
-		if save && let Some(command) = state.update_server_notifications(guild, self.edits) {
-			commands.push(command);
-			self.submitted = true;
+		if save {
+			if let Some(command) = state.update_server_notifications(guild, self.edits) {
+				commands.push(command);
+			}
+			self.edits = NotificationOptions::default();
+			close = true;
 		}
 		close || response.close
 	}

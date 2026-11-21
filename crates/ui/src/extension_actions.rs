@@ -605,7 +605,8 @@ mod tests {
 		assert!(
 			state
 				.prepare_set_reaction(Id(700), emoji.clone(), true)
-				.is_err()
+				.unwrap()
+				.is_none()
 		);
 		state.command_rejected(command);
 		assert!(
@@ -649,19 +650,25 @@ mod tests {
 		else {
 			panic!("expected edit command");
 		};
-		assert!(
-			view.apply_extension_app_action(
-				&mut state,
-				AppAction::EditMessage {
-					channel_id: "22".into(),
-					message_id: "700".into(),
-					content: "Another edit".into(),
-				},
-				&mut commands,
-			)
-			.is_err()
-		);
-		assert!(commands.is_empty());
+		// A second edit on the same message coalesces optimistically and signals pre-wire cancel.
+		view.apply_extension_app_action(
+			&mut state,
+			AppAction::EditMessage {
+				channel_id: "22".into(),
+				message_id: "700".into(),
+				content: "Another edit".into(),
+			},
+			&mut commands,
+		)
+		.unwrap();
+		assert!(matches!(
+			commands.pop(),
+			Some(Command::CancelPendingWrite {
+				kind: client_core::optimistic::WriteKind::Edit,
+				request: cancel_req,
+			}) if cancel_req == request
+		));
+		assert_eq!(state.timeline.get(message).unwrap().content, "Another edit");
 		// A transport failure rolls back this edit without ending the session. Queue
 		// rejection reports Capacity, which deliberately disconnects the account.
 		state.apply_edit_result(

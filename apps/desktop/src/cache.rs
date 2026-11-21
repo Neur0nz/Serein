@@ -82,6 +82,8 @@ pub enum Operation {
 		channel: Id,
 		request: u64,
 	},
+	LoadStartupSelection,
+	SaveStartupSelection(Id),
 	SaveDraft {
 		channel: Id,
 		content: String,
@@ -129,6 +131,16 @@ pub enum Outcome {
 	Accounts {
 		roster: Result<Vec<model::SavedAccount>, StoreError>,
 		pruned: Vec<Id>,
+	},
+	StartupSelection {
+		account: Id,
+		channel: Option<Id>,
+		epoch: u64,
+	},
+	StartupSelectionSaved {
+		channel: Id,
+		result: Option<Result<(), StoreError>>,
+		epoch: u64,
 	},
 	Channel {
 		channel: Id,
@@ -320,6 +332,8 @@ impl Cache {
 			Operation::LoadChannel { .. }
 				| Operation::SaveChannel { .. }
 				| Operation::SaveChanges { .. }
+				| Operation::LoadStartupSelection
+				| Operation::SaveStartupSelection(_)
 		) && !self.history.allows(epoch)
 		{
 			return false;
@@ -520,6 +534,32 @@ fn execute(
 				Err(error) => Err(*error),
 			});
 		}
+		Operation::LoadStartupSelection => {
+			let channel = if history.allows(epoch) {
+				store
+					.as_ref()
+					.ok()
+					.and_then(|store| store.startup_selection(account).ok())
+					.flatten()
+			} else {
+				None
+			};
+			return Outcome::StartupSelection {
+				account,
+				channel,
+				epoch,
+			};
+		}
+		Operation::SaveStartupSelection(channel) => {
+			return Outcome::StartupSelectionSaved {
+				channel: *channel,
+				result: history.allows(epoch).then(|| match store {
+					Ok(store) => store.save_startup_selection(account, *channel),
+					Err(error) => Err(*error),
+				}),
+				epoch,
+			};
+		}
 		_ => {}
 	}
 	if matches!(
@@ -578,7 +618,9 @@ fn execute(
 		| Operation::LoadMinimizeToTray
 		| Operation::SaveMinimizeToTray(_)
 		| Operation::LoadAccountPresences
-		| Operation::SaveAccountPresence(_) => unreachable!(),
+		| Operation::SaveAccountPresence(_)
+		| Operation::LoadStartupSelection
+		| Operation::SaveStartupSelection(_) => unreachable!(),
 	};
 	let result = match store {
 		Ok(store) => match operation {
@@ -597,7 +639,9 @@ fn execute(
 			| Operation::LoadMinimizeToTray
 			| Operation::SaveMinimizeToTray(_)
 			| Operation::LoadAccountPresences
-			| Operation::SaveAccountPresence(_) => {
+			| Operation::SaveAccountPresence(_)
+			| Operation::LoadStartupSelection
+			| Operation::SaveStartupSelection(_) => {
 				unreachable!()
 			}
 			Operation::LoadAppearance => store

@@ -1,9 +1,40 @@
+use crate::optimistic::ActionKind;
 use crate::{
 	State,
 	auth::{AuthState, Failure},
+	optimistic::{Cancelled, CoalescedSlot, Finish, SetOutcome, WriteKind},
 };
 use model::{Freshness, Id, Reaction, ReactionEmoji, User};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+const MAX_REACTION_WRITES: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReactionKey {
+	channel: Id,
+	message: Id,
+	emoji_id: Option<Id>,
+	emoji_name: Option<String>,
+}
+impl ReactionKey {
+	fn new(channel: Id, message: Id, emoji: &ReactionEmoji) -> Self {
+		if emoji.id.is_some() {
+			Self {
+				channel,
+				message,
+				emoji_id: emoji.id,
+				emoji_name: None,
+			}
+		} else {
+			Self {
+				channel,
+				message,
+				emoji_id: None,
+				emoji_name: emoji.name.clone(),
+			}
+		}
+	}
+}
 
 pub enum Command {
 	Read {
@@ -84,9 +115,10 @@ pub struct ReactionUsers {
 pub struct Reactions {
 	dirty: BTreeSet<Id>,
 	read: Option<(Id, u64)>,
-	pub writing: Option<(Id, u64)>,
-	// One bounded reaction list before/after the single in-flight write.
-	preview: Option<(Id, Vec<Reaction>, Vec<Reaction>)>,
+	writes: CoalescedSlot<ReactionKey, bool, MAX_REACTION_WRITES>,
+	write_emojis: BTreeMap<ReactionKey, ReactionEmoji>,
+	// Bounded per-message (confirmed_before, displayed_after) previews for active/awaiting-readback writes.
+	previews: BTreeMap<Id, (Vec<Reaction>, Vec<Reaction>)>,
 	sequence: u64,
 	pub users: Option<ReactionUsers>,
 }
@@ -99,24 +131,66 @@ impl Reactions {
 	pub fn reset(&mut self) {
 		self.dirty.clear();
 		self.read = None;
-		self.writing = None;
-		self.preview = None;
+		let _ = self.writes.cancel_all();
+		self.write_emojis.clear();
+		self.previews.clear();
 		self.users = None;
 		self.sequence = self.sequence.wrapping_add(1);
 	}
+	pub fn has_fast_pending(&self) -> bool {
+		!self.writes.is_empty()
+	}
 	pub fn busy(&self) -> bool {
-		self.writing.is_some() || self.preview.is_some()
+		self.writes.len() >= MAX_REACTION_WRITES
+	}
+	fn has_write_for(&self, message: Id) -> bool {
+		self.writes.iter().any(|(k, _)| k.message == message)
 	}
 	pub fn display<'a>(&'a self, message: &'a model::Message) -> Option<&'a [Reaction]> {
-		self.preview
-			.as_ref()
-			.filter(|(id, _, _)| *id == message.id)
-			.map(|(_, _, after)| after.as_slice())
+		self.previews
+			.get(&message.id)
+			.map(|(_, after)| after.as_slice())
 			.or(message.reactions.as_deref())
 	}
 	pub fn invalidated(&self, id: Id) -> bool {
 		self.dirty.contains(&id) || self.read.is_some_and(|(message, _)| message == id)
 	}
+	fn recompute_preview(&mut self, channel: Id, message: Id) {
+		let Some((before, after)) = self.previews.get_mut(&message) else {
+			return;
+		};
+		let mut computed = before.clone();
+		for (key, entry) in self.writes.iter() {
+			if key.channel != channel || key.message != message {
+				continue;
+			}
+			let Some(emoji) = self.write_emojis.get(key) else {
+				continue;
+			};
+			apply_optimistic_toggle(&mut computed, emoji, entry.desired);
+		}
+		*after = computed;
+	}
+}
+fn apply_optimistic_toggle(values: &mut Vec<Reaction>, emoji: &ReactionEmoji, desired_me: bool) {
+	if let Some(reaction) = values.iter_mut().find(|r| r.emoji.same(emoji)) {
+		if reaction.me != desired_me {
+			reaction.count = if desired_me {
+				reaction.count.saturating_add(1)
+			} else {
+				reaction.count.saturating_sub(1)
+			};
+			reaction.me = desired_me;
+		}
+	} else if desired_me && values.len() < model::MAX_REACTIONS {
+		values.push(Reaction {
+			emoji: emoji.clone(),
+			count: 1,
+			me: true,
+			me_burst: false,
+		});
+	}
+	values.retain(|r| r.count > 0);
 }
 impl State {
 	pub fn request_reaction_users(
@@ -215,26 +289,24 @@ impl State {
 		{
 			return Ok(());
 		}
-		let preview = self
-			.reactions
-			.preview
-			.as_ref()
-			.filter(|(id, _, _)| *id == message);
+		let preview = self.reactions.previews.get(&message);
 		let known = self
 			.timeline
 			.get(message)
 			.and_then(|m| m.reactions.as_ref())
-			.or_else(|| preview.map(|(_, before, _)| before));
+			.or_else(|| preview.map(|(before, _)| before));
 		let Some(mut values) = known.cloned() else {
 			// A delta cannot reconstruct a missing snapshot. Keep the bounded readback.
 			self.refresh_reactions(message);
 			return Ok(());
 		};
 		update(&mut values)?;
-		let mut preview = preview.cloned();
-		if let Some((_, before, after)) = &mut preview {
+		let mut updated_preview = preview.cloned();
+		if let Some((before, after)) = &mut updated_preview {
 			update(before)?;
-			update(after)?;
+			if !self.reactions.has_write_for(message) {
+				update(after)?;
+			}
 		}
 		// Keep the existing coalesced verification: a snapshot can already include a
 		// delayed Gateway event. Paint the delta now, never an empty loading row.
@@ -242,8 +314,11 @@ impl State {
 			return Ok(());
 		}
 		self.timeline.set_reactions(message, Some(values))?;
-		if let Some(preview) = preview {
-			self.reactions.preview = Some(preview);
+		if let Some(preview) = updated_preview {
+			self.reactions.previews.insert(message, preview);
+			if self.reactions.has_write_for(message) {
+				self.reactions.recompute_preview(channel, message);
+			}
 		}
 		self.revision += 1;
 		Ok(())
@@ -268,21 +343,15 @@ impl State {
 		true
 	}
 	pub fn next_reaction_read(&mut self) -> Option<crate::Command> {
-		if self.reactions.writing.is_none()
-			&& self
-				.reactions
-				.preview
-				.as_ref()
-				.is_some_and(|(id, _, _)| self.timeline.get(*id).is_none())
-		{
-			self.reactions.preview = None;
-		}
+		let writes = &self.reactions.writes;
+		self.reactions.previews.retain(|id, _| {
+			writes.iter().any(|(k, _)| k.message == *id) || self.timeline.get(*id).is_some()
+		});
 		if self.auth != AuthState::Authenticated
 			|| !self.gateway_connected
 			|| self.freshness != Freshness::Fresh
 			|| self.history_pending
 			|| self.reactions.read.is_some()
-			|| self.reactions.writing.is_some()
 		{
 			return None;
 		}
@@ -293,7 +362,13 @@ impl State {
 		self.reactions
 			.dirty
 			.retain(|id| self.timeline.get(*id).is_some());
-		let message = self.reactions.dirty.pop_first()?;
+		let message = self
+			.reactions
+			.dirty
+			.iter()
+			.copied()
+			.find(|id| !self.reactions.has_write_for(*id))?;
+		self.reactions.dirty.remove(&message);
 		self.reactions.sequence = self.reactions.sequence.wrapping_add(1);
 		let request = self.reactions.sequence;
 		self.reactions.read = Some((message, request));
@@ -302,6 +377,34 @@ impl State {
 			message,
 			request,
 		}))
+	}
+	pub(crate) fn cancel_reaction_pre_wire(&mut self, request: u64) {
+		let Some((key, outcome)) = self.reactions.writes.cancelled_by_seq(request) else {
+			return;
+		};
+		match outcome {
+			Cancelled::Stale => {}
+			Cancelled::Settled => {
+				self.reactions.write_emojis.remove(&key);
+				if self.reactions.has_write_for(key.message) {
+					self.reactions.recompute_preview(key.channel, key.message);
+				} else {
+					self.reactions.previews.remove(&key.message);
+				}
+				self.revision += 1;
+			}
+			Cancelled::DispatchFollowUp { seq, value } => {
+				if let Some(emoji) = self.reactions.write_emojis.get(&key).cloned() {
+					self.push_follow_up(crate::Command::Reactions(Command::Set {
+						channel: key.channel,
+						message: key.message,
+						emoji,
+						add: value,
+						request: seq,
+					}));
+				}
+			}
+		}
 	}
 	/// Set the desired membership without toggling a state that changed since approval.
 	pub fn prepare_set_reaction(
@@ -314,28 +417,41 @@ impl State {
 			"This reaction is unavailable with the current access or pending action";
 		if !emoji.valid()
 			|| emoji.name.is_none()
-			|| self.reactions.writing.is_some()
-			|| self.reactions.preview.is_some()
 			|| self.timeline.is_deleted(message)
 			|| !self.can_react(message, Some(&emoji), add)
 		{
 			return Err(UNAVAILABLE);
 		}
-		let reactions = self
-			.timeline
-			.get(message)
-			.and_then(|message| message.reactions.as_ref())
+		let current_list = self
+			.reactions
+			.previews
+			.get(&message)
+			.map(|(_, after)| after.as_slice())
+			.or_else(|| {
+				self.timeline
+					.get(message)
+					.and_then(|message| message.reactions.as_deref())
+			})
 			.ok_or(UNAVAILABLE)?;
-		if reactions
+		if current_list
 			.iter()
 			.any(|reaction| reaction.emoji.same(&emoji) && reaction.me)
 			== add
 		{
 			return Ok(None);
 		}
-		self.prepare_reaction(message, emoji)
-			.map(Some)
-			.ok_or(UNAVAILABLE)
+		if let Some(command) = self.prepare_reaction(message, emoji.clone()) {
+			return Ok(Some(command));
+		}
+		if self.selected.is_some_and(|channel| {
+			self.reactions
+				.writes
+				.entry(&ReactionKey::new(channel, message, &emoji))
+				.is_some()
+		}) {
+			return Ok(None);
+		}
+		Err(UNAVAILABLE)
 	}
 	pub fn prepare_reaction(
 		&mut self,
@@ -345,8 +461,6 @@ impl State {
 		if self.auth != AuthState::Authenticated
 			|| !self.gateway_connected
 			|| self.freshness != Freshness::Fresh
-			|| self.reactions.writing.is_some()
-			|| self.reactions.preview.is_some()
 			|| !emoji.valid()
 			|| emoji.name.is_none()
 		{
@@ -356,47 +470,92 @@ impl State {
 		if self.timeline.is_deleted(message) {
 			return None;
 		}
-		let reactions = self.timeline.get(message)?.reactions.as_ref()?;
-		let existing = reactions.iter().find(|r| r.emoji.same(&emoji));
-		if existing.is_none() && reactions.len() >= model::MAX_REACTIONS {
+		let key = ReactionKey::new(channel, message, &emoji);
+		let before_list = self
+			.reactions
+			.previews
+			.get(&message)
+			.map(|(before, _)| before.clone())
+			.or_else(|| self.timeline.get(message)?.reactions.clone())?;
+		let displayed_list = self
+			.reactions
+			.previews
+			.get(&message)
+			.map(|(_, after)| after.as_slice())
+			.unwrap_or(before_list.as_slice());
+		let existing_displayed = displayed_list.iter().find(|r| r.emoji.same(&emoji));
+		if existing_displayed.is_none() && displayed_list.len() >= model::MAX_REACTIONS {
 			self.status = "Reaction limit reached";
 			return None;
 		}
-		let add = existing.is_none_or(|r| !r.me);
+		let add = existing_displayed.is_none_or(|r| !r.me);
 		if !self.can_react(message, Some(&emoji), add) {
 			return None;
 		}
-		let before = reactions.clone();
-		let mut after = before.clone();
-		if let Some(reaction) = after.iter_mut().find(|r| r.emoji.same(&emoji)) {
-			reaction.count = if add {
-				reaction.count.checked_add(1)?
-			} else {
-				reaction.count.saturating_sub(1)
-			};
-			reaction.me = add;
-		} else {
-			after.push(Reaction {
-				emoji: emoji.clone(),
-				count: 1,
-				me: true,
-				me_burst: false,
-			});
+		if add
+			&& let Some(r) = existing_displayed
+			&& r.count == u32::MAX
+		{
+			return None;
 		}
-		after.retain(|r| r.count > 0);
-		self.reactions.cancel_read();
-		self.reactions.preview = Some((message, before, after));
-		self.revision += 1;
-		self.reactions.sequence = self.reactions.sequence.wrapping_add(1);
-		let request = self.reactions.sequence;
-		self.reactions.writing = Some((message, request));
-		Some(crate::Command::Reactions(Command::Set {
-			channel,
-			message,
-			emoji,
-			add,
-			request,
-		}))
+		let confirmed_me = before_list.iter().any(|r| r.emoji.same(&emoji) && r.me);
+		let outcome = self.reactions.writes.set(key.clone(), confirmed_me, add);
+		match outcome {
+			SetOutcome::Full => {
+				self.status = "Too many pending reactions";
+				None
+			}
+			SetOutcome::Dispatch(seq) => {
+				self.reactions.write_emojis.insert(key, emoji.clone());
+				if !self.reactions.previews.contains_key(&message) {
+					if self.reactions.previews.len() >= MAX_REACTION_WRITES {
+						let evict = self
+							.reactions
+							.previews
+							.keys()
+							.copied()
+							.find(|id| !self.reactions.has_write_for(*id));
+						if let Some(evict) = evict {
+							self.reactions.previews.remove(&evict);
+						}
+					}
+					self.reactions
+						.previews
+						.insert(message, (before_list.clone(), before_list));
+				}
+				if self.reactions.read.is_some_and(|(id, _)| id == message) {
+					self.reactions.cancel_read();
+				}
+				self.reactions.recompute_preview(channel, message);
+				self.revision += 1;
+				Some(crate::Command::Reactions(Command::Set {
+					channel,
+					message,
+					emoji,
+					add,
+					request: seq,
+				}))
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: Some(cancel_seq),
+			} => {
+				self.reactions.write_emojis.entry(key).or_insert(emoji);
+				self.reactions.recompute_preview(channel, message);
+				self.revision += 1;
+				Some(crate::Command::CancelPendingWrite {
+					kind: WriteKind::Reaction,
+					request: cancel_seq,
+				})
+			}
+			SetOutcome::Queued {
+				cancel_in_flight: None,
+			} => {
+				self.reactions.write_emojis.entry(key).or_insert(emoji);
+				self.reactions.recompute_preview(channel, message);
+				self.revision += 1;
+				None
+			}
+		}
 	}
 	pub fn apply_reactions(&mut self, event: Event) -> Result<(), &'static str> {
 		match event {
@@ -412,6 +571,10 @@ impl State {
 					return Err("Invalid reaction delta");
 				}
 				let own = self.user.as_ref().is_some_and(|me| me.id == user);
+				if own && !burst {
+					let key = ReactionKey::new(channel, message, &emoji);
+					self.reactions.writes.observe_authoritative(&key, add);
+				}
 				self.update_reactions(channel, message, |values| {
 					apply_delta(values, &emoji, own, add, burst)
 				})?;
@@ -423,6 +586,26 @@ impl State {
 			} => {
 				if emoji.as_ref().is_some_and(|e| !e.valid()) {
 					return Err("Invalid reaction emoji");
+				}
+				let matching_keys: Vec<ReactionKey> = self
+					.reactions
+					.writes
+					.iter()
+					.filter_map(|(k, _)| {
+						if k.channel != channel || k.message != message {
+							return None;
+						}
+						let matches_emoji = emoji.as_ref().is_none_or(|e| {
+							self.reactions
+								.write_emojis
+								.get(k)
+								.is_some_and(|we| we.same(e))
+						});
+						matches_emoji.then(|| k.clone())
+					})
+					.collect();
+				for key in matching_keys {
+					self.reactions.writes.observe_authoritative(&key, false);
 				}
 				self.update_reactions(channel, message, |values| {
 					values.retain(|r| emoji.as_ref().is_some_and(|e| !r.emoji.same(e)));
@@ -457,24 +640,21 @@ impl State {
 				}
 				match result {
 					Ok(reactions) if !self.reactions.dirty.contains(&message) => {
-						self.timeline.set_reactions(message, Some(reactions))?;
-						if self
-							.reactions
-							.preview
-							.as_ref()
-							.is_some_and(|(id, _, _)| *id == message)
-						{
-							self.reactions.preview = None;
+						self.timeline
+							.set_reactions(message, Some(reactions.clone()))?;
+						if self.reactions.has_write_for(message) {
+							self.reactions
+								.previews
+								.insert(message, (reactions.clone(), reactions));
+							self.reactions.recompute_preview(channel, message);
+						} else {
+							self.reactions.previews.remove(&message);
 						}
 					}
 					Ok(_) => {} // A newer invalidation schedules one fresh read, never an old snapshot.
 					Err(failure) => {
-						if self
-							.reactions
-							.preview
-							.as_ref()
-							.is_some_and(|(id, _, _)| *id == message)
-							&& let Some((_, _, after)) = self.reactions.preview.take()
+						if !self.reactions.has_write_for(message)
+							&& let Some((_, after)) = self.reactions.previews.remove(&message)
 						{
 							self.timeline.set_reactions(message, Some(after))?;
 						}
@@ -506,34 +686,72 @@ impl State {
 				request,
 				result,
 			} => {
-				if self.selected != Some(channel)
-					|| self.reactions.writing != Some((message, request))
-				{
+				let Some((key, finish)) = self.reactions.writes.finish_by_seq(request, result)
+				else {
+					return Ok(());
+				};
+				if key.channel != channel || key.message != message {
 					return Ok(());
 				}
-				self.reactions.writing = None;
-				match result {
-					Ok(()) => {
-						self.refresh_reactions(message);
-					}
-					Err(failure) => {
-						let before = self.reactions.preview.take().map(|(_, before, _)| before);
-						// A timed-out write may have succeeded. Read back; never repeat the write.
-						if failure == Failure::Ambiguous {
-							self.refresh_reactions(message);
-						}
-						if let Some(before) = before
-							&& self
-								.timeline
-								.get(message)
-								.is_some_and(|m| m.reactions.is_none())
+				match finish {
+					Finish::Stale => return Ok(()),
+					Finish::Settled { confirmed } => {
+						let emoji = self.reactions.write_emojis.remove(&key);
+						if let Some(emoji) = &emoji
+							&& let Some((before, _)) = self.reactions.previews.get_mut(&message)
 						{
-							self.timeline.set_reactions(message, Some(before))?;
+							apply_optimistic_toggle(before, emoji, confirmed);
+						}
+						if self.reactions.has_write_for(message) {
+							self.reactions.recompute_preview(channel, message);
+						} else if self.selected == Some(channel) {
+							self.refresh_reactions(message);
+						} else {
+							self.reactions.previews.remove(&message);
+						}
+					}
+					Finish::DispatchFollowUp { seq, value } => {
+						if let Some(emoji) = self.reactions.write_emojis.get(&key).cloned() {
+							if let Some((before, _)) = self.reactions.previews.get_mut(&message) {
+								apply_optimistic_toggle(before, &emoji, !value);
+							}
+							self.reactions.recompute_preview(channel, message);
+							self.push_follow_up(crate::Command::Reactions(Command::Set {
+								channel,
+								message,
+								emoji,
+								add: value,
+								request: seq,
+							}));
+						}
+					}
+					Finish::RolledBack { failure, .. } => {
+						self.reactions.write_emojis.remove(&key);
+						if self.reactions.has_write_for(message) {
+							self.reactions.recompute_preview(channel, message);
+						} else {
+							let before = self
+								.reactions
+								.previews
+								.remove(&message)
+								.map(|(before, _)| before);
+							if failure == Failure::Ambiguous {
+								if self.selected == Some(channel) {
+									self.refresh_reactions(message);
+								}
+							} else if let Some(before) = before
+								&& self.selected == Some(channel)
+								&& self.timeline.get(message).is_some()
+							{
+								self.timeline.set_reactions(message, Some(before))?;
+							}
 						}
 						self.revision += 1;
 						self.status = failure.label();
-						if failure.ends_session() {
+						if failure.ends_session() && failure != Failure::Capacity {
 							self.fail(failure);
+						} else {
+							self.push_write_error(ActionKind::Reaction, "", failure);
 						}
 					}
 				}
@@ -1413,17 +1631,18 @@ mod tests {
 				}]),
 			)
 			.unwrap();
-		assert!(matches!(
-			state.prepare_reaction(Id(50), emoji.clone()),
-			Some(crate::Command::Reactions(Command::Set { add: true, .. }))
-		));
+		let Some(crate::Command::Reactions(Command::Set {
+			add: true, request, ..
+		})) = state.prepare_reaction(Id(50), emoji.clone())
+		else {
+			panic!("expected reaction add");
+		};
 		let visible = state
 			.reactions
 			.display(state.timeline.get(Id(50)).unwrap())
 			.unwrap();
 		assert!(visible[0].me);
 		assert_eq!(visible[0].count, 2);
-		let (_, request) = state.reactions.writing.unwrap();
 		state
 			.apply_reactions(Event::Written {
 				channel: Id(10),
@@ -1451,10 +1670,14 @@ mod tests {
 				}]),
 			)
 			.unwrap();
-		assert!(matches!(
-			state.prepare_reaction(Id(50), emoji.clone()),
-			Some(crate::Command::Reactions(Command::Set { add: false, .. }))
-		));
+		let Some(crate::Command::Reactions(Command::Set {
+			add: false,
+			request,
+			..
+		})) = state.prepare_reaction(Id(50), emoji.clone())
+		else {
+			panic!("expected reaction remove");
+		};
 		assert!(
 			state
 				.reactions
@@ -1462,7 +1685,6 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		let (_, request) = state.reactions.writing.unwrap();
 		state
 			.apply_reactions(Event::Written {
 				channel: Id(10),

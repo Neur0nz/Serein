@@ -42,7 +42,11 @@ impl Cards {
 		let mut changed = false;
 		selected.retain(|id| poll.answers.iter().any(|a| a.id == *id));
 		let results = ended || voted || *preview;
-		let enabled = state.can_vote_poll(message) && state.polls.pending.is_none();
+		let enabled = state.can_vote_poll(message)
+			&& !state
+				.polls
+				.pending
+				.is_some_and(|(c, m, _)| c == message.channel && m == Some(message.id));
 		let mut action = None;
 		let width = (ui.available_width() - 32.0).clamp(48.0, 440.0);
 		egui::Frame::new()

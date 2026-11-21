@@ -5037,3 +5037,15 @@ moderation-confirm-ban = 停權
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = 此擴充功能目前沒有可顯示的內容。
+
+# Optimistic write feedback
+action-write-failed = 「{ $action }」失敗。{ $reason }
+action-write-failed-for = 對 { $target } 執行「{ $action }」失敗。{ $reason }
+action-write-forward-note = 傳送轉發附註
+action-write-poll = 投票
+action-write-forbidden = 沒有權限。
+action-write-rate-limited = 請稍候再試。
+action-write-network = 連線失敗。
+action-write-ambiguous = 結果未知。請先在 Discord 中確認，再試一次。
+action-write-busy = 待處理的變更過多。請稍後再試。
+action-write-rejected = Discord 拒絕了變更或傳回非預期的回應。

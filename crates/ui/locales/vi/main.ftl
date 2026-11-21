@@ -5232,3 +5232,15 @@ native-login-web-open = Mở trang đăng nhập của Discord
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Plugin này chưa có gì để hiển thị.
+
+# Optimistic write feedback
+action-write-failed = Không thể thực hiện “{ $action }”. { $reason }
+action-write-failed-for = Không thể thực hiện “{ $action }” cho { $target }. { $reason }
+action-write-forward-note = Gửi ghi chú chuyển tiếp
+action-write-poll = Bình chọn
+action-write-forbidden = Không có quyền.
+action-write-rate-limited = Hãy đợi một chút trước khi thử lại.
+action-write-network = Kết nối thất bại.
+action-write-ambiguous = Chưa rõ kết quả. Hãy kiểm tra Discord trước khi thử lại.
+action-write-busy = Có quá nhiều thay đổi đang chờ. Hãy thử lại sau ít phút.
+action-write-rejected = Discord đã từ chối thay đổi hoặc trả về phản hồi không mong đợi.

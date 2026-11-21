@@ -5196,3 +5196,15 @@ native-login-web-open = Discord 로그인 페이지 열기
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = 이 플러그인은 아직 표시할 항목이 없습니다.
+
+# Optimistic write feedback
+action-write-failed = ‘{ $action }’ 작업에 실패했습니다. { $reason }
+action-write-failed-for = { $target }에 대한 ‘{ $action }’ 작업에 실패했습니다. { $reason }
+action-write-forward-note = 전달 메모 보내기
+action-write-poll = 설문
+action-write-forbidden = 권한이 없습니다.
+action-write-rate-limited = 잠시 기다린 후 다시 시도하세요.
+action-write-network = 연결에 실패했습니다.
+action-write-ambiguous = 결과를 확인할 수 없습니다. 다시 시도하기 전에 Discord를 확인하세요.
+action-write-busy = 대기 중인 변경 사항이 너무 많습니다. 잠시 후 다시 시도하세요.
+action-write-rejected = Discord가 변경을 거부했거나 예상하지 못한 응답을 보냈습니다.

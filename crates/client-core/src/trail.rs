@@ -24,7 +24,7 @@ impl Trail {
 		self.cursor + 1 < self.places.len()
 	}
 
-	pub(super) fn is_empty(&self) -> bool {
+	pub fn is_empty(&self) -> bool {
 		self.places.is_empty()
 	}
 

@@ -5068,3 +5068,15 @@ moderation-confirm-ban = Zabanovat
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Tento zásuvný modul zatím nemá co zobrazit.
+
+# Optimistic write feedback
+action-write-failed = { $action }: akce se nezdařila. { $reason }
+action-write-failed-for = { $action } ({ $target }): akce se nezdařila. { $reason }
+action-write-forward-note = Odeslat poznámku k přeposlání
+action-write-poll = Anketa
+action-write-forbidden = Přístup odepřen.
+action-write-rate-limited = Chvíli počkejte a zkuste to znovu.
+action-write-network = Připojení selhalo.
+action-write-ambiguous = Výsledek není známý. Před dalším pokusem zkontrolujte Discord.
+action-write-busy = Čeká příliš mnoho změn. Zkuste to za chvíli.
+action-write-rejected = Discord změnu odmítl nebo vrátil neočekávanou odpověď.

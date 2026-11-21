@@ -181,14 +181,9 @@ fn notification_edits_require_save_and_submit_one_sparse_write() {
 			},
 		}
 	);
-	assert!(h.state.server_action_pending());
-	h.click("Saving…");
-	h.click("All messages");
-	assert_eq!(
-		h.commands.len(),
-		1,
-		"pending controls cannot enqueue a second write"
-	);
+	assert!(h.state.has_fast_pending_writes());
+	assert_eq!(h.state.server_notification_settings(Id(10)).level, Some(1));
+	assert!(!h.shown(), "optimistic save closes the notification editor");
 	h.state.apply(Envelope {
 		generation: h.state.generation,
 		event: Event::ServerAction(client_core::server_actions::Event::Written {
@@ -198,8 +193,9 @@ fn notification_edits_require_save_and_submit_one_sparse_write() {
 		}),
 	});
 	h.settle();
-	assert!(!h.state.server_action_pending());
+	assert!(!h.state.has_fast_pending_writes());
 	assert_eq!(h.state.server_notification_settings(Id(10)).level, Some(1));
+	h.open();
 	h.click("Save changes");
 	assert_eq!(h.commands.len(), 1, "acknowledged draft is clean");
 }

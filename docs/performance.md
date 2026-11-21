@@ -1,5 +1,24 @@
 # Performance findings
 
+## Startup restore and optimistic writes
+
+Compared `058e3357` with the startup and optimistic-write changes using locked Rust 1.99.1
+release builds of `replay-bench`. Both binaries ran on the same Linux x86-64 host with an Intel
+Xeon Platinum 8573C. The process was pinned to one logical CPU. Each binary ran one warmup and
+five measured samples, alternating the order between samples. Repeat with `cargo replay` and
+`cargo replay --ack-reconciliation`, then run the built binaries directly for sampling.
+
+| Reducer workload | Baseline median (range) | After median (range) | Median delta |
+| --- | ---: | ---: | ---: |
+| 100,000 message events | 82.613 ms (80.925–100.985) | 86.107 ms (81.393–92.443) | +3.494 ms |
+| Eight bulk acknowledgments of 1,024 channels | 53.365 ms (48.811–56.426) | 50.064 ms (49.173–119.582) | −3.301 ms |
+
+The runs retained the same 500 timeline records and 417,492–417,977 estimated bytes. The timing
+ranges overlap, with one slow bulk acknowledgment run. These samples cannot establish a timing
+change. This workload measures reducer reconciliation. Native startup timing, process CPU and
+memory under interaction, REST scheduling, and comparisons of standard package sizes remain
+unmeasured.
+
 ## Voice connection ping
 
 Compared `5a11f95b` with the voice ping change using locked Rust 1.99.1 release builds

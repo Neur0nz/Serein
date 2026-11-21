@@ -349,7 +349,7 @@ impl crate::MessagingUi {
 				Ok(()) => self.stage_slash_direct(state, pending, target),
 				Err(error) => state.status = error,
 			}
-		} else if state.selected == Some(pending.origin) && state.user_action_pending() {
+		} else if state.selected == Some(pending.origin) && state.dm_open_pending() {
 			self.slash_direct = Some(pending);
 		}
 	}

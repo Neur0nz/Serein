@@ -55,6 +55,8 @@ impl Desktop {
 		self.avatar_start_failed = false;
 		self.messaging.clear_avatars();
 		self.state.generation += 1;
+		self.startup_selection_loading = false;
+		self.startup_selection_saving = None;
 		self.messaging.channel_preferences = model::ChannelPreferences::default();
 		self.messaging.channel_preferences_changed = false;
 		self.messaging.channel_preferences_loaded = false;
@@ -83,12 +85,19 @@ impl Desktop {
 		let secret = Arc::new(secret);
 		self.pending_save = save.then(|| secret.clone());
 		self.pending_account_save = Some(secret.clone());
+		// An explicit switch supplies the expected identity, but the token has not proved it yet.
+		let cached_presence = if self.switching.is_some() {
+			Default::default()
+		} else {
+			self.account_presences.clone()
+		};
 		self.connection = Some(connection::Connection::start(
 			self.runtime.handle(),
 			secret,
 			self.state.generation,
-			self.state.user.as_ref().map(|u| u.id),
-			self.account_presences.clone(),
+			self.switching
+				.or_else(|| self.state.user.as_ref().map(|u| u.id)),
+			cached_presence,
 			self.api_proxy.subscribe(),
 			ctx.clone(),
 		));
@@ -99,6 +108,9 @@ impl Desktop {
 	/// Ends the current session. Only logging out removes this account's local data and
 	/// saved login; switching and adding keep both so the account stays in the switcher.
 	fn end_session(&mut self, ctx: &egui::Context, intent: SessionEnd) {
+		if !intent.forgets() {
+			self.sync_startup_selection(ctx, true);
+		}
 		self.captcha.close();
 		self.notification_runtime.clear(&self.window);
 		self.messaging.image_share_requested = None;
@@ -132,8 +144,11 @@ impl Desktop {
 		self.pending_save = None;
 		self.pending_account_save = None;
 		let old_account = self.state.user.as_ref().filter(|_| !was_demo).map(|u| u.id);
-		self.switching = None;
+		self.clear_startup_restore();
 		self.roster_pending = false;
+		self.startup_selection_saved = None;
+		self.startup_selection_saving = None;
+		self.startup_selection_saved_at = None;
 		self.state.logout();
 		if intent.forgets()
 			&& let (Some(cache), Some(account)) = (&self.cache, old_account)
@@ -239,6 +254,7 @@ impl Desktop {
 		if self.fixture_only || self.state.demo {
 			return;
 		}
+		self.clear_startup_restore();
 		let started = self.store.as_mut().is_some_and(|store| {
 			store.load_account(self.state.generation, account, std::time::Instant::now())
 		});
@@ -325,15 +341,15 @@ impl Desktop {
 	/// Boot stage while a saved login is being restored, so launch shows progress
 	/// instead of a welcome card the user cannot act on yet.
 	pub(super) fn restoring(&self) -> Option<String> {
-		// Fixture-only preview of the restore screen, e.g. `--demo --demo-restoring`.
 		#[cfg(feature = "demo")]
-		if self.fixture_only && std::env::args().any(|arg| arg == "--demo-restoring") {
+		if self.startup_demo {
 			return Some(ui::i18n::translate(
 				"main-restoring-checking-your-saved-login",
 			));
 		}
 		if self.fixture_only
 			|| self.state.demo
+			|| self.state.user.is_some()
 			|| self.login.is_some()
 			|| self.forgetting
 			|| matches!(
@@ -351,15 +367,28 @@ impl Desktop {
 				"main-restoring-checking-your-saved-login",
 			));
 		}
-		self.connection
-			.is_some()
+		(self.connection.is_some() || self.deferred_connect.is_some())
 			.then(|| ui::i18n::translate("main-restoring-connecting-to-discord"))
 	}
-	/// Restore screen for returning accounts: no sign-in controls, just the stage,
-	/// an indeterminate bar and a way out to the welcome screen.
+	/// Shows the startup shell unless a granted extension supplies its own start screen.
 	pub(super) fn restoring_screen(&mut self, ui: &mut egui::Ui, stage: &str) {
-		let p = ui::design::palette(ui);
 		let screen = self.extensions.start_screen();
+		if screen.is_none() {
+			let sidebar_width = self.messaging.reading_preferences.sidebar_width;
+			let hide_title_bar = self.messaging.hide_title_bar;
+			let traffic_light_inset = self.traffic_light_inset();
+			if ui::startup_shell::show(
+				ui,
+				stage,
+				sidebar_width,
+				hide_title_bar,
+				traffic_light_inset,
+			) {
+				self.cancel_restoring();
+			}
+			return;
+		}
+		let p = ui::design::palette(ui);
 		egui::CentralPanel::default()
 			.frame(egui::Frame::NONE.fill(ui::design::window_palette(ui).canvas))
 			.show(ui, |ui| {
@@ -447,15 +476,7 @@ impl Desktop {
 							)
 							.clicked()
 							{
-								if let Some(store) = &mut self.store {
-									store.cancel_load();
-								}
-								self.connection = None;
-								self.pending_save = None;
-								self.pending_account_save = None;
-								self.state.auth = AuthState::Unauthenticated;
-								self.state.status = "Disconnected";
-								self.credential_status = "";
+								self.cancel_restoring();
 							}
 						},
 					);
@@ -463,6 +484,30 @@ impl Desktop {
 					self.start_screen.end(ui);
 				});
 			});
+	}
+	pub(super) fn clear_startup_restore(&mut self) {
+		self.restoring_saved_login = false;
+		self.startup_selection_loading = false;
+		self.switching = None;
+		self.deferred_connect = None;
+	}
+	fn cancel_restoring(&mut self) {
+		#[cfg(feature = "demo")]
+		if std::mem::take(&mut self.startup_demo) {
+			self.state.logout();
+			return;
+		}
+		if let Some(store) = &mut self.store {
+			store.cancel_load();
+		}
+		self.connection = None;
+		self.pending_save = None;
+		self.pending_account_save = None;
+		self.clear_startup_restore();
+		self.state.generation = self.state.generation.wrapping_add(1);
+		self.state.auth = AuthState::Unauthenticated;
+		self.state.status = "Disconnected";
+		self.credential_status = "";
 	}
 	pub(super) fn traffic_light_inset(&self) -> f32 {
 		if self.messaging.hide_title_bar {
@@ -651,6 +696,7 @@ impl Desktop {
 				if let Some(store) = &mut self.store {
 					store.cancel_load();
 				}
+				self.clear_startup_restore();
 				self.native.open = true;
 			}
 		}
@@ -664,6 +710,7 @@ impl Desktop {
 		if let Some(store) = &mut self.store {
 			store.cancel_load();
 		}
+		self.clear_startup_restore();
 		self.native.close();
 		self.credential_status = "";
 		let wake = ctx.clone();
@@ -1138,7 +1185,10 @@ impl Desktop {
 				if connect.clicked() && !self.fixture_only {
 					let input = std::mem::take(&mut *self.token_input);
 					match SessionSecret::from_owner_input(input) {
-						Ok(secret) => self.connect(secret, true, ctx),
+						Ok(secret) => {
+							self.clear_startup_restore();
+							self.connect(secret, true, ctx);
+						}
 						Err(failure) => self.state.status = failure.label(),
 					}
 				}

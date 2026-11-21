@@ -5037,3 +5037,15 @@ moderation-confirm-ban = 封禁
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = 此插件暂时没有可显示的内容。
+
+# Optimistic write feedback
+action-write-failed = “{ $action }”失败。{ $reason }
+action-write-failed-for = 对 { $target } 执行“{ $action }”失败。{ $reason }
+action-write-forward-note = 发送转发附言
+action-write-poll = 投票
+action-write-forbidden = 没有权限。
+action-write-rate-limited = 请稍等片刻再试。
+action-write-network = 连接失败。
+action-write-ambiguous = 结果未知。请先在 Discord 中查看，然后再试。
+action-write-busy = 待处理的更改过多。请稍后再试。
+action-write-rejected = Discord 拒绝了更改或返回了异常响应。

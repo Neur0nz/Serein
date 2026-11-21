@@ -244,15 +244,14 @@ pub fn show(
 							);
 						}
 						ui.horizontal(|ui| {
-							if ui
-								.button(crate::i18n::translate_if_key(
-									&(if pending.sticker.is_some() {
-										crate::i18n::translate("pending-show-dismiss")
+							if !pending.is_forwarded_message()
+								&& ui
+									.button(crate::i18n::translate(if pending.sticker.is_some() {
+										"pending-show-dismiss"
 									} else {
-										crate::i18n::translate("pending-show-restore-to-composer")
-									}),
-								))
-								.clicked()
+										"pending-show-restore-to-composer"
+									}))
+									.clicked()
 							{
 								*restore = Some(pending.nonce.clone());
 							}

@@ -15,6 +15,11 @@ impl DiscordApi {
 			Failure::ProtocolAt("Discord messaging permissions are unavailable or unsupported");
 		let unconfirmed =
 			Failure::ProtocolAt("Messaging permissions were not confirmed; reload before retrying");
+		let _settings = if change.is_some() {
+			Some(self.account_settings_write().await?)
+		} else {
+			None
+		};
 		let bytes = self
 			.request_limited(
 				Method::GET,

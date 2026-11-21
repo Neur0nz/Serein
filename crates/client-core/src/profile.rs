@@ -1020,6 +1020,69 @@ mod tests {
 			.unwrap();
 		assert!(state.profile_cache.is_empty());
 	}
+	#[test]
+	fn confirmed_optimistic_unfriend_invalidates_the_open_private_profile() {
+		use crate::user_actions::Event as UserEvent;
+		let user = Id(2);
+		let now = Instant::now();
+		for gateway_first in [true, false] {
+			let mut state = own_state();
+			let mut private = *own_data("Friend");
+			private.user.id = user;
+			private.private = true;
+			state
+				.apply_user_action(UserEvent::Friends(Some(vec![(
+					private.user.clone(),
+					"friend".into(),
+				)])))
+				.unwrap();
+			state
+				.apply_user_action(UserEvent::Requests(Some(vec![])))
+				.unwrap();
+			state
+				.apply_user_action(UserEvent::Relationship {
+					user,
+					blocked: false,
+				})
+				.unwrap();
+			state.profile_cache.insert(user, None, private, now);
+			assert!(state.request_profile(user, None).is_none());
+			let Command::UserAction {
+				action, request, ..
+			} = state.remove_friend(user).unwrap()
+			else {
+				panic!("expected a friend removal");
+			};
+			let response = if gateway_first {
+				state
+					.apply_user_action(UserEvent::Relationship {
+						user,
+						blocked: false,
+					})
+					.unwrap();
+				UserEvent::Friend {
+					user,
+					friend: false,
+					profile: None,
+				}
+			} else {
+				UserEvent::Written {
+					action,
+					request,
+					result: Ok(()),
+				}
+			};
+			state.apply_user_action(response).unwrap();
+			assert!(!state.profile_cache.contains(user, None, now));
+			assert!(
+				state
+					.profile
+					.as_ref()
+					.is_some_and(|profile| profile.loading && profile.data.is_none())
+			);
+			assert_eq!(state.take_preload_retries().count(), 1);
+		}
+	}
 	fn complete_own(state: &mut State, result: Result<Box<UserProfile>, Failure>) {
 		state.apply(Envelope {
 			generation: state.generation,

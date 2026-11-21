@@ -560,13 +560,22 @@ mod tests {
 			view.apply_extension_account_action(
 				&mut state,
 				AppAction::AddFriend {
-					username: "another.synthetic".into()
+					username: "new.synthetic".into()
 				},
 				&mut commands
 			)
 			.is_err()
 		);
 		assert_eq!(commands.len(), 1);
+		view.apply_extension_account_action(
+			&mut state,
+			AppAction::AddFriend {
+				username: "another.synthetic".into(),
+			},
+			&mut commands,
+		)
+		.unwrap();
+		assert_eq!(commands.len(), 2);
 	}
 
 	#[test]
